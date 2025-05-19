@@ -12,24 +12,6 @@ cache = TTLCache(maxsize=100, ttl=60)  # Cache for 60 seconds
 
 COINGECKO_API_KEY = ""  # Trial API key
 
-@router.get("/{coin_id}")
-def proxy_coingecko(coin_id: str):
-    try:
-        url = f"{settings.COINGECKO_API_URL}/coins/{coin_id}?localization=false&tickers=false&market_data=true&community_data=false&developer_data=false"
-        headers = {"x-cg-demo-api-key": COINGECKO_API_KEY} if COINGECKO_API_KEY else {}
-        logger.info(f"Fetching CoinGecko data for {coin_id}")
-        resp = requests.get(url, headers=headers)
-        if resp.status_code == 200:
-            return resp.json()
-        logger.error(f"Failed to fetch from CoinGecko for {coin_id}: {resp.status_code}")
-        return JSONResponse(
-            content={"error": "Failed to fetch from CoinGecko", "status_code": resp.status_code},
-            status_code=resp.status_code
-        )
-    except Exception as e:
-        logger.error(f"Error fetching CoinGecko data for {coin_id}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error fetching from CoinGecko: {str(e)}")
-
 @router.get("/realtime")
 def get_realtime_data():
     cache_key = "realtime_data"
@@ -52,6 +34,24 @@ def get_realtime_data():
         )
     except Exception as e:
         logger.error(f"Error fetching realtime data: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error fetching from CoinGecko: {str(e)}")
+
+@router.get("/{coin_id}")
+def proxy_coingecko(coin_id: str):
+    try:
+        url = f"{settings.COINGECKO_API_URL}/coins/{coin_id}?localization=false&tickers=false&market_data=true&community_data=false&developer_data=false"
+        headers = {"x-cg-demo-api-key": COINGECKO_API_KEY} if COINGECKO_API_KEY else {}
+        logger.info(f"Fetching CoinGecko data for {coin_id}")
+        resp = requests.get(url, headers=headers)
+        if resp.status_code == 200:
+            return resp.json()
+        logger.error(f"Failed to fetch from CoinGecko for {coin_id}: {resp.status_code}")
+        return JSONResponse(
+            content={"error": "Failed to fetch from CoinGecko", "status_code": resp.status_code},
+            status_code=resp.status_code
+        )
+    except Exception as e:
+        logger.error(f"Error fetching CoinGecko data for {coin_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error fetching from CoinGecko: {str(e)}")
 
 @router.get("/historical/{coin_id}")
