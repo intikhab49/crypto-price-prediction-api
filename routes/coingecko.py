@@ -107,7 +107,7 @@ def get_realtime_data():
         raise HTTPException(status_code=500, detail=f"Error fetching from CoinGecko: {str(e)}")
 
 @router.get("/historical/{coin_id}", operation_id="get_historical_data")
-async def get_historical_data(coin_id: str, days: int = 7):
+async def get_historical_data(coin_id: str, days: int = 365):
     """Get historical market data with fallback to Yahoo Finance."""
     cache_key = f"historical_{coin_id}_{days}"
     if cache_key in cache:
@@ -147,7 +147,7 @@ def get_coin_data(coin_id: str):
         retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
         session.mount("https://", HTTPAdapter(max_retries=retries))
         
-        url = f"{settings.COINGECKO_API_URL}/coins/{coin_id}"
+        url = f"{settings.COINGECKO_API_URL}/coins/{coin_id}?localization=false&tickers=false&market_data=true&community_data=false&developer_data=false"
         logger.info(f"Fetching CoinGecko data for {coin_id}")
         resp = session.get(url, headers=get_headers(), timeout=10)
 
