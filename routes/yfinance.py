@@ -2,79 +2,74 @@ from fastapi import APIRouter, HTTPException
 import yfinance as yf
 from typing import Optional
 import logging
-import asyncio
+import sys
+import pandas as pd
+from utils.data_fetcher import DataFetcher
+from fastapi.responses import JSONResponse
 
 router = APIRouter()
-logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
 
-async def fetch_yfinance_data(symbol: str, period: str, interval: str):
-    for attempt in range(3):
-        try:
-            logger.info(f"Attempt {attempt + 1}: Fetching data for {symbol}, period={period}, interval={interval}")
-            ticker = yf.Ticker(symbol)
-            data = ticker.history(period=period, interval=interval, timeout=10, auto_adjust=False)
-            if data.empty:
-                logger.warning(f"No data found for {symbol}")
-                return None
-            return data
-        except Exception as e:
-            logger.error(f"Attempt {attempt + 1} failed: {str(e)}")
-            if attempt == 2:
-                raise HTTPException(status_code=500, detail=f"Error fetching data: {str(e)}")
-            await asyncio.sleep(2)
+# Setup logging
+logger = logging.getLogger('yfinance_routes')
+logger.setLevel(logging.DEBUG)
+
+# Ensure we don't duplicate handlers
+if not logger.handlers:
+    # Console handler
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.DEBUG)
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    ch.setFormatter(formatter)
+    logger.addHandler(ch)
+    
+    # File handler
+    fh = logging.FileHandler('yfinance_debug.log')
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
+
+# Initialize DataFetcher
+data_fetcher = DataFetcher()
+
+@router.get("/test")
+async def test_endpoint():
+    """Simple test endpoint to verify yfinance is working."""
+    try:
+        logger.debug("Testing yfinance with BTC-USD")
+        data = data_fetcher.get_yfinance_data("BTC-USD", period="1d", interval="1h")
+        return {"status": "success", "message": "yfinance is working correctly", "data": data}
+    except Exception as e:
+        logger.error(f"Error testing yfinance: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 @router.get("/historical/{symbol}")
-async def get_historical_data(
-    symbol: str,
-    period: Optional[str] = "1y",
-    interval: Optional[str] = "1d"
-):
+async def get_historical_data(symbol: str, period: str = "7d", interval: str = "1d"):
+    """Get historical market data with fallback to CoinGecko."""
     try:
-        if not symbol.endswith('-USD'):
-            symbol = f"{symbol}-USD"
-        data = await fetch_yfinance_data(symbol, period, interval)
-        if data is None:
-            alt_symbol = symbol.replace("-USD", "-USDT")
-            data = await fetch_yfinance_data(alt_symbol, period, interval)
-            if data is None:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"No data found for symbol {symbol} or {alt_symbol}"
-                )
-        result = {
-            "dates": data.index.strftime('%Y-%m-%d %H:%M:%S').tolist(),
-            "open": data['Open'].tolist(),
-            "high": data['High'].tolist(),
-            "low": data['Low'].tolist(),
-            "close": data['Close'].tolist(),
-            "volume": data['Volume'].tolist()
+        # Convert period to days for DataFetcher
+        period_map = {
+            "1d": 1, "7d": 7, "1mo": 30, "3mo": 90,
+            "6mo": 180, "1y": 365, "2y": 730
         }
+        days = period_map.get(period, 7)  # Default to 7 days if period not recognized
+        
+        # Try Yahoo Finance first, fallback to CoinGecko
+        result = await data_fetcher.get_historical_data(symbol, days, use_coingecko_first=False)
         return result
+        
     except Exception as e:
-        logger.error(f"Final error for {symbol}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error fetching data: {str(e)}")
+        logger.error(f"Error fetching historical data for {symbol}: {str(e)}")
+        return JSONResponse(status_code=503, content={"error": str(e)})
 
 @router.get("/info/{symbol}")
 async def get_symbol_info(symbol: str):
+    """Get current market info for a symbol."""
     try:
-        if not symbol.endswith('-USD'):
-            symbol = f"{symbol}-USD"
-        ticker = yf.Ticker(symbol)
-        info = ticker.info
-        if not info:
-            raise HTTPException(
-                status_code=404,
-                detail=f"No information found for symbol {symbol}"
-            )
-        return {
-            "name": info.get("longName", ""),
-            "symbol": symbol,
-            "currentPrice": info.get("currentPrice", 0),
-            "marketCap": info.get("marketCap", 0),
-            "volume24h": info.get("volume24h", 0),
-            "change24h": info.get("regularMarketChangePercent", 0)
-        }
+        logger.debug(f"Fetching info for {symbol}")
+        data = data_fetcher.get_yfinance_info(symbol)
+        logger.debug(f"Successfully processed info for {symbol}")
+        return {"status": "success", "data": data}
+        
     except Exception as e:
-        logger.error(f"Error fetching info for {symbol}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error fetching symbol info: {str(e)}")
+        logger.error(f"Error processing info for {symbol}: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})

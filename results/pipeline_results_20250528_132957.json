@@ -1,0 +1,22 @@
+{
+  "start_time": "2025-05-28T13:29:57.661333+00:00",
+  "symbols": [
+    "BTC"
+  ],
+  "timeframes": [
+    "1h"
+  ],
+  "data_validation": {
+    "BTC": {
+      "1h": {
+        "status": "error",
+        "error": "Data validation failed for BTC (1h)"
+      }
+    }
+  },
+  "training": null,
+  "evaluation": null,
+  "predictions": {},
+  "end_time": "2025-05-28T13:29:58.553385+00:00",
+  "duration": "0:00:00.892052"
+}

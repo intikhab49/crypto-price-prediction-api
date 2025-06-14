@@ -1,0 +1,85 @@
+{
+    "symbol": "BTC",
+    "asset_type": "cryptocurrency",
+    "timeframe": "4h",
+    "timestamp": "2025-06-13T16:59:35.406637+00:00",
+    "prediction": {
+        "symbol": "BTC",
+        "timeframe": "4h",
+        "predicted_price": 104165.84375,
+        "last_price": 105720.98532215251,
+        "prediction_time": "2025-06-13T20:58:53+00:00",
+        "current_time": "2025-06-13T16:59:35.401571+00:00",
+        "probability": 0.605943856560588,
+        "confidence_factors": {
+            "model_confidence": 0.8,
+            "price_levels": [
+                {
+                    "type": "support",
+                    "price": 102765.8392946315,
+                    "strength": 3.761404694802675,
+                    "proximity": 0.013623247423247936,
+                    "signal": "bounce",
+                    "confidence": 1.1992773539895132
+                },
+                {
+                    "type": "resistance",
+                    "price": 106070.99773896646,
+                    "strength": 1.3706014973348035,
+                    "proximity": 0.01796112066047414,
+                    "signal": "reversal",
+                    "confidence": 0.13972455378195686
+                }
+            ],
+            "technical_indicators": [
+                {
+                    "indicator": "RSI",
+                    "value": 52.09591270628843,
+                    "signal": "neutral",
+                    "strength": 0.3
+                },
+                {
+                    "indicator": "MACD",
+                    "value": -405.54714338399936,
+                    "signal_line": -639.9577223591518,
+                    "signal": "bullish_trend",
+                    "strength": 0.7,
+                    "trend_strength": 0.36629072637957555
+                },
+                {
+                    "indicator": "BollingerBands",
+                    "position": "within_bands",
+                    "signal": "continuation",
+                    "strength": 0.4,
+                    "bandwidth": 0.026334362193623156
+                },
+                {
+                    "indicator": "Volume",
+                    "value": 54414371296.42912,
+                    "sma": 47641651538.91145,
+                    "ratio": 1.1421596342432847,
+                    "signal": "normal",
+                    "strength": 0.628431926848657
+                }
+            ],
+            "timeframe_factor": 0.95,
+            "available_indicators": {
+                "rsi": true,
+                "macd": true,
+                "bollinger": true,
+                "volume": true
+            },
+            "weights": {
+                "model": 0.10000000000000003,
+                "technical": 0.6,
+                "support_resistance": 0.3
+            }
+        },
+        "model_metrics": {
+            "lookback": 60,
+            "input_size": 26,
+            "hidden_size": 128,
+            "num_layers": 2
+        }
+    }
+}

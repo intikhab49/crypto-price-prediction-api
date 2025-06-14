@@ -1,0 +1,47 @@
+{
+  "start_time": "2025-05-26T15:27:15.134929+00:00",
+  "symbols": [
+    "BTC"
+  ],
+  "timeframes": [
+    "1h"
+  ],
+  "training": {
+    "total": 1,
+    "successful": 0,
+    "results": [
+      {
+        "symbol": "BTC",
+        "timeframe": "1h",
+        "result": {
+          "status": "error",
+          "error": "Cannot set a DataFrame with multiple columns to the single column BB_upper"
+        }
+      }
+    ]
+  },
+  "evaluation": {
+    "total": 1,
+    "successful": 0,
+    "results": [
+      {
+        "symbol": "BTC",
+        "timeframe": "1h",
+        "status": "error",
+        "error": "'model_config'"
+      }
+    ]
+  },
+  "predictions": {
+    "BTC": {
+      "1h": {
+        "error": "500: Merged data failed quality validation"
+      },
+      "ensemble": {
+        "error": "500: Merged data failed quality validation"
+      }
+    }
+  },
+  "end_time": "2025-05-26T15:27:28.951588+00:00",
+  "duration": "0:00:13.816659"
+}

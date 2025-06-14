@@ -1,5 +1,52 @@
-venv/
-db.sqlite3
-__pycache__/
+# Python virtual environments
+env/
 cryptoenv/
-*.pyc
+venv/
+.env/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+*.log.*
+
+# Local databases
+*.sqlite3
+*.db
+
+# Cache directories
+cache/
+.cache/
+
+# Model files (if you want to exclude them)
+*.pkl
+*.pth
+*.h5
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Environment variables
+.env
+
+# Test coverage
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover

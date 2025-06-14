@@ -1,0 +1,77 @@
+{
+    "symbol": "XRP",
+    "asset_type": "cryptocurrency",
+    "timeframe": "4h",
+    "timestamp": "2025-06-10T13:19:00.655663+00:00",
+    "prediction": {
+        "symbol": "XRP",
+        "timeframe": "4h",
+        "predicted_price": 2.2856953144073486,
+        "last_price": 2.3131752877999032,
+        "prediction_time": "2025-06-10T17:18:44+00:00",
+        "current_time": "2025-06-10T13:19:00.652468+00:00",
+        "probability": 0.4841748168835653,
+        "confidence_factors": {
+            "model_confidence": 0.8,
+            "price_levels": [
+                {
+                    "type": "resistance",
+                    "price": 2.2569147957396205,
+                    "strength": 0.2078982084592984,
+                    "proximity": 0.012752151176489751,
+                    "signal": "breakout",
+                    "confidence": 0.07534073927958071
+                }
+            ],
+            "technical_indicators": [
+                {
+                    "indicator": "RSI",
+                    "value": 61.18506060126753,
+                    "signal": "neutral",
+                    "strength": 0.3
+                },
+                {
+                    "indicator": "MACD",
+                    "value": 0.008711878120835959,
+                    "signal_line": 0.009178606280515936,
+                    "signal": "bearish_trend",
+                    "strength": 0.45084956750685923,
+                    "trend_strength": 0.050849567506859226
+                },
+                {
+                    "indicator": "BollingerBands",
+                    "position": "within_bands",
+                    "signal": "continuation",
+                    "strength": 0.4,
+                    "bandwidth": 0.02310888525443918
+                },
+                {
+                    "indicator": "Volume",
+                    "value": 2909065176.407726,
+                    "sma": 2591638160.1840734,
+                    "ratio": 1.122481224848575,
+                    "signal": "normal",
+                    "strength": 0.624496244969715
+                }
+            ],
+            "timeframe_factor": 0.95,
+            "available_indicators": {
+                "rsi": true,
+                "macd": true,
+                "bollinger": true,
+                "volume": true
+            },
+            "weights": {
+                "model": 0.25,
+                "technical": 0.6,
+                "support_resistance": 0.15
+            }
+        },
+        "model_metrics": {
+            "lookback": 60,
+            "input_size": 26,
+            "hidden_size": 128,
+            "num_layers": 2
+        }
+    }
+}

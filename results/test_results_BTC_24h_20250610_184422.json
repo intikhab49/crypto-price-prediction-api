@@ -1,0 +1,68 @@
+{
+    "symbol": "BTC",
+    "asset_type": "cryptocurrency",
+    "timeframe": "24h",
+    "timestamp": "2025-06-10T13:44:22.396279+00:00",
+    "prediction": {
+        "symbol": "BTC",
+        "timeframe": "24h",
+        "predicted_price": 100712.0546875,
+        "last_price": 109434.6953125,
+        "prediction_time": "2025-06-11T00:00:00+00:00",
+        "current_time": "2025-06-10T13:44:22.393446+00:00",
+        "probability": 0.5821099358791058,
+        "confidence_factors": {
+            "model_confidence": 0.8,
+            "price_levels": [],
+            "technical_indicators": [
+                {
+                    "indicator": "RSI",
+                    "value": 61.0459107755419,
+                    "signal": "neutral",
+                    "strength": 0.3
+                },
+                {
+                    "indicator": "MACD",
+                    "value": 1305.1502049479022,
+                    "signal_line": 1335.003671115819,
+                    "signal": "bearish_trend",
+                    "strength": 0.42236208544877246,
+                    "trend_strength": 0.022362085448772443
+                },
+                {
+                    "indicator": "BollingerBands",
+                    "position": "within_bands",
+                    "signal": "continuation",
+                    "strength": 0.4,
+                    "bandwidth": 0.09160861337805885
+                },
+                {
+                    "indicator": "Volume",
+                    "value": 56486330368.0,
+                    "sma": 50201707370.0,
+                    "ratio": 1.1251874353929967,
+                    "signal": "normal",
+                    "strength": 0.6250374870785994
+                }
+            ],
+            "timeframe_factor": 1.0,
+            "available_indicators": {
+                "rsi": true,
+                "macd": true,
+                "bollinger": true,
+                "volume": true
+            },
+            "weights": {
+                "model": 0.4,
+                "technical": 0.6,
+                "support_resistance": 0
+            }
+        },
+        "model_metrics": {
+            "lookback": 30,
+            "input_size": 26,
+            "hidden_size": 256,
+            "num_layers": 3
+        }
+    }
+}

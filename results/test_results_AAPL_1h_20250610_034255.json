@@ -1,0 +1,85 @@
+{
+    "symbol": "AAPL",
+    "asset_type": "stock",
+    "timeframe": "1h",
+    "timestamp": "2025-06-09T22:42:55.271621+00:00",
+    "prediction": {
+        "symbol": "AAPL",
+        "timeframe": "1h",
+        "predicted_price": 197.67355346679688,
+        "last_price": 204.49,
+        "prediction_time": "2025-06-09T23:00:00+00:00",
+        "current_time": "2025-06-09T22:42:55.270182+00:00",
+        "probability": 0.4145733951774178,
+        "confidence_factors": {
+            "model_confidence": 0.8,
+            "price_levels": [
+                {
+                    "type": "support",
+                    "price": 198.76970066277013,
+                    "strength": 0.5716197203884832,
+                    "proximity": 0.005514659388821876,
+                    "signal": "breakout",
+                    "confidence": 0.414005317494679
+                },
+                {
+                    "type": "support",
+                    "price": 194.32459791163214,
+                    "strength": 0.30340670272613557,
+                    "proximity": 0.017233822126253167,
+                    "signal": "bounce",
+                    "confidence": 0.041963845391375966
+                }
+            ],
+            "technical_indicators": [
+                {
+                    "indicator": "RSI",
+                    "value": 57.990147588092576,
+                    "signal": "neutral",
+                    "strength": 0.3
+                },
+                {
+                    "indicator": "MACD",
+                    "value": 0.6011553298486092,
+                    "signal_line": 0.4066719547917969,
+                    "signal": "bullish_trend",
+                    "strength": 0.7,
+                    "trend_strength": 0.47823158879097427
+                },
+                {
+                    "indicator": "BollingerBands",
+                    "position": "within_bands",
+                    "signal": "continuation",
+                    "strength": 0.4,
+                    "bandwidth": 0.02953815887853288
+                },
+                {
+                    "indicator": "Volume",
+                    "value": 45250.0,
+                    "sma": 3931017.3,
+                    "ratio": 0.011511015227534106,
+                    "signal": "low",
+                    "strength": 0.20230220304550683
+                }
+            ],
+            "timeframe_factor": 0.9,
+            "available_indicators": {
+                "rsi": true,
+                "macd": true,
+                "bollinger": true,
+                "volume": true
+            },
+            "weights": {
+                "model": 0.10000000000000003,
+                "technical": 0.6,
+                "support_resistance": 0.3
+            }
+        },
+        "model_metrics": {
+            "lookback": 72,
+            "input_size": 26,
+            "hidden_size": 128,
+            "num_layers": 2
+        }
+    }
+}

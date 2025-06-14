@@ -1,0 +1,46 @@
+{
+  "start_time": "2025-06-12T17:53:07.442637+00:00",
+  "symbols": [
+    "AAPL"
+  ],
+  "timeframes": [
+    "1h"
+  ],
+  "data_validation": {
+    "AAPL": {
+      "1h": {
+        "status": "error",
+        "error": "DataValidator.__init__() missing 1 required positional argument: 'timeframe'"
+      }
+    }
+  },
+  "training": {
+    "total": 1,
+    "successful": 0,
+    "results": [
+      {
+        "symbol": "AAPL",
+        "timeframe": "1h",
+        "result": {
+          "status": "error",
+          "error": "Failed after 3 attempts"
+        }
+      }
+    ]
+  },
+  "evaluation": {
+    "total": 1,
+    "successful": 0,
+    "results": [
+      {
+        "symbol": "AAPL",
+        "timeframe": "1h",
+        "status": "error",
+        "error": "No trained model found for AAPL (1h)"
+      }
+    ]
+  },
+  "predictions": {},
+  "end_time": "2025-06-12T17:55:07.529884+00:00",
+  "duration": "0:02:00.087247"
+}

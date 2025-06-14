@@ -1,0 +1,93 @@
+import torch
+import torch.nn as nn
+import numpy as np
+import pandas as pd
+import joblib
+from controllers.prediction import get_latest_data, BiLSTMWithAttention, TIMEFRAME_MAP
+from sklearn.preprocessing import RobustScaler
+import logging
+import os
+from datetime import datetime
+import pytz
+import torch.serialization
+
+# Allowlist datetime.datetime for safe model loading
+torch.serialization.add_safe_globals([datetime])
+
+# Setup logging
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+
+def load_model(symbol, timeframe, input_size=14, hidden_size=32, num_layers=2):
+    """Load pre-trained model and scaler"""
+    model_path = f"models/{symbol}_{timeframe}_model.pth"
+    scaler_path = f"models/{symbol}_{timeframe}_scaler.pkl"
+    if not os.path.exists(model_path) or not os.path.exists(scaler_path):
+        raise FileNotFoundError(f"Model or scaler not found at {model_path}")
+    
+    hidden_size = 32 if timeframe == "24h" else 64
+    model = BiLSTMWithAttention(input_size=input_size, hidden_size=hidden_size, num_layers=num_layers, dropout=0.3)
+    checkpoint = torch.load(model_path, map_location=torch.device('cpu'), weights_only=False)
+    state_dict = checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint
+    model.load_state_dict(state_dict)
+    scaler = joblib.load(scaler_path)
+    model.eval()
+    return model, scaler
+
+def fetch_and_predict_btc_price(symbol="BTC", timeframe="1h"):
+    """Fetch data and predict price for given timeframe"""
+    try:
+        if timeframe not in TIMEFRAME_MAP:
+            raise ValueError(f"Invalid timeframe. Must be one of {list(TIMEFRAME_MAP.keys())}")
+        
+        lookback = TIMEFRAME_MAP[timeframe]["lookback"]
+        
+        df = get_latest_data(symbol, timeframe)
+        
+        model, scaler = load_model(symbol, timeframe)
+        
+        features = df[['Close', 'SMA', 'EMA', 'RSI', 'MACD', 'Bollinger_Upper', 
+                       'Bollinger_Lower', 'ATR', 'OBV', 'VWAP', 'Momentum', 'Volatility', 'Lag1', 'Sentiment_Up']].values
+        scaled_features = scaler.transform(features)
+        X_input = scaled_features[-lookback:].reshape(1, lookback, 14)
+        
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model.to(device)
+        with torch.no_grad():
+            input_tensor = torch.FloatTensor(X_input).to(device)
+            prediction_scaled = model(input_tensor).cpu().numpy()
+        
+        if prediction_scaled.ndim == 0:
+            prediction_scaled = prediction_scaled.reshape(1,)
+        elif prediction_scaled.ndim > 1:
+            prediction_scaled = prediction_scaled.flatten()[:1]
+        
+        prediction = scaler.inverse_transform(
+            np.concatenate([prediction_scaled.reshape(1, 1), np.zeros((1, 13))], axis=1)
+        )[0, 0]
+        
+        last_actual_price = df['Close'].iloc[-1]
+        time_delta = pd.Timedelta(hours=1 if timeframe != "24h" else 24)
+        result = {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "predicted_price": float(prediction),
+            "last_actual_price": float(last_actual_price),
+            "prediction_time": (df.index[-1] + time_delta).isoformat(),
+            "current_time": datetime.now(pytz.UTC).isoformat(),
+            "rsi": float(df['RSI'].iloc[-1]),
+            "price_source": "yfinance"
+        }
+        logger.info(f"Predicted Price for {symbol} {timeframe}: {result}")
+        return result
+    
+    except Exception as e:
+        logger.error(f"Prediction failed: {str(e)}", exc_info=True)
+        raise
+
+if __name__ == "__main__":
+    try:
+        result = fetch_and_predict_btc_price(symbol="BTC", timeframe="1h")
+        print(f"Prediction result: {result}")
+    except Exception as e:
+        print(f"Error: {str(e)}")

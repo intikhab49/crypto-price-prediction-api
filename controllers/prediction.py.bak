@@ -1,0 +1,2143 @@
+# Standard Library Imports
+import os
+import sys
+import time
+import logging
+import json
+import math
+import asyncio # Added asyncio
+from datetime import datetime, timedelta
+from collections import defaultdict
+import traceback # Often useful, ensure it's there if used
+import pytz # If timezone operations are direct in this file
+import copy
+
+# Third-party Imports
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn # For direct nn module usage like MSELoss, HuberLoss etc.
+from torch.utils.data import TensorDataset, DataLoader
+import torch.optim as optim # Can use this or from torch.optim import Adam, etc.
+from torch.optim.lr_scheduler import ReduceLROnPlateau, OneCycleLR # Add OneCycleLR if implementing
+from torch.nn.utils import clip_grad_norm_
+import yfinance as yf # If direct yf calls are made here, else only in data_fetcher
+import joblib
+import requests
+from sklearn.preprocessing import RobustScaler, StandardScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, mean_absolute_percentage_error
+from sklearn.model_selection import train_test_split # Added train_test_split
+from scipy.stats import ks_2samp # If check_data_drift uses it directly here
+from cachetools import TTLCache
+import psutil
+import ta # Technical Analysis library
+import torch.nn.functional as F
+
+# FastAPI Imports (if this controller is directly used by FastAPI)
+from fastapi import HTTPException 
+
+# Project-specific Imports
+from config import settings, FEATURE_LIST # Assuming FEATURE_LIST is still relevant here
+from controllers.data_fetcher import DataFetcher
+from controllers.model_manager import ModelManager
+from controllers.error_handler import ErrorTracker, ErrorSeverity, ErrorCategory
+from controllers.data_validator import DataValidator, rate_limit # Check if rate_limit is used here or just in DataValidator
+from controllers.data_quality import DataQualityMetrics
+from ml_models.bilstm_predictor import BiLSTMWithAttention
+from controllers.early_stopping import EarlyStopping  # Add this import
+from controllers.timeframe_config import TIMEFRAME_MAP  # Add this import at the top with other imports
+
+# Type Hinting
+from typing import Tuple, Dict, Any, Optional, List # List was missing in my previous example
+
+# Specific torch.nn components if you prefer explicit imports over nn.Module
+# from torch.nn import Linear, ReLU, Sigmoid, Tanh, Dropout, BatchNorm1d, LSTM, GRU, RNN # etc. 
+# The generic `import torch.nn as nn` is usually sufficient if you use `nn.Linear`, `nn.LSTM`.
+
+
+
+def get_next_timestamp(last_timestamp, timeframe):
+    """Calculate next timestamp based on timeframe with timezone handling"""
+    timeframe_deltas = {
+        "30m": pd.Timedelta(minutes=30),
+        "1h": pd.Timedelta(hours=1),
+        "4h": pd.Timedelta(hours=4),
+        "24h": pd.Timedelta(days=1)
+    }
+    now = datetime.now(pytz.UTC)
+    if last_timestamp.tzinfo is None:
+        last_timestamp = last_timestamp.tz_localize('UTC')
+    if timeframe == "24h":
+        next_ts = (last_timestamp + pd.Timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    else:
+        next_ts = last_timestamp + timeframe_deltas[timeframe]
+    if next_ts <= now:
+        periods = int((now - last_timestamp) / timeframe_deltas[timeframe]) + 1
+        if timeframe == "24h":
+            next_ts = (last_timestamp + periods * timeframe_deltas[timeframe]).replace(hour=0, minute=0, second=0, microsecond=0)
+        else:
+            next_ts = last_timestamp + periods * timeframe_deltas[timeframe]
+    return next_ts
+
+# Allowlist datetime.datetime for safe model loading
+torch.serialization.add_safe_globals([datetime])
+
+# Setup logging
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Constants from settings
+MODEL_PATH = settings.MODEL_PATH
+MAX_RETRIES = 3
+RETRY_DELAY = 2
+EPOCHS = 200
+PATIENCE = 30
+CACHE_DIR = "cache"
+BATCH_SIZE = settings.BATCH_SIZE
+MIN_MEMORY_GB = 0.75
+VALIDATION_SPLIT = settings.VALIDATION_SPLIT
+
+# Cache for sentiment and price data
+SENTIMENT_CACHE = TTLCache(maxsize=100, ttl=settings.CACHE_TTL)
+PRICE_CACHE = TTLCache(maxsize=10, ttl=60)
+
+# CoinGecko ID mapping
+COINGECKO_ID_MAP = {
+    "BTC": "bitcoin",
+    "ETH": "ethereum",
+    "XRP": "ripple"
+}
+
+# Add after imports
+model_manager = ModelManager()
+error_tracker = ErrorTracker()
+
+# New synchronous helper function for training data - CHANGING TO ASYNC
+async def _get_and_prepare_training_data(symbol: str, timeframe: str, lookback: int, test_size: float = settings.VALIDATION_SPLIT) -> tuple:
+    """Get and prepare training data with proper tensor shapes"""
+    try:
+        logger.info(f"Starting training data preparation for {symbol} ({timeframe}), lookback={lookback}")
+        
+        # Get historical data and prepare features
+        features_df, target_series = await prepare_features(symbol, timeframe)
+        
+        # Get the definitive list of features for model input
+        feature_column_names_for_model_input = get_feature_list_for_model(features_df)
+        
+        logger.info(f"Using definitive feature columns for model input: {feature_column_names_for_model_input}")
+
+        # Ensure all columns designated for model input are actually in features_df
+        missing_cols_in_df = [col for col in feature_column_names_for_model_input if col not in features_df.columns]
+        if missing_cols_in_df:
+            raise ValueError(f"Missing columns in features_df: {missing_cols_in_df}")
+        
+        # Extract features and target
+        X_data_to_sequence = features_df[feature_column_names_for_model_input].values
+        y_data = target_series.values
+        
+        # Log data shapes before scaling
+        logger.info(f"[_GET_AND_PREPARE_TRAINING_DATA] Shape of data PASSED to scaler.fit() (X_data_to_sequence): {X_data_to_sequence.shape}")
+        logger.info(f"[_GET_AND_PREPARE_TRAINING_DATA] Columns of data PASSED to scaler.fit() (X_data_to_sequence): {feature_column_names_for_model_input}")
+        
+        # Scale features
+        feature_scaler = StandardScaler()
+        X_data_scaled = feature_scaler.fit_transform(X_data_to_sequence)
+        
+        # Scale target
+        target_scaler = StandardScaler()
+        y_data_scaled = target_scaler.fit_transform(y_data.reshape(-1, 1))
+        
+        # Log target scaling info
+        logger.info(f"[_GET_AND_PREPARE_TRAINING_DATA] Target scaling - center: {target_scaler.mean_[0]}, scale: {target_scaler.scale_[0]}")
+        logger.info(f"[_GET_AND_PREPARE_TRAINING_DATA] Target range before scaling - min: {y_data.min()}, max: {y_data.max()}")
+        logger.info(f"[_GET_AND_PREPARE_TRAINING_DATA] Target range after scaling - min: {y_data_scaled.min()}, max: {y_data_scaled.max()}")
+        
+        # Create sequences
+        X_sequences = []
+        y_sequences = []
+        
+        for i in range(len(X_data_scaled) - lookback):
+            X_sequences.append(X_data_scaled[i:(i + lookback)])
+            y_sequences.append(y_data_scaled[i + lookback])
+        
+        # Convert to numpy arrays with correct shapes
+        X_sequences = np.array(X_sequences)  # Shape: (n_samples, lookback, n_features)
+        y_sequences = np.array(y_sequences)  # Shape: (n_samples, 1)
+        
+        # Split into training and validation sets
+        split_idx = int(len(X_sequences) * (1 - test_size))
+        
+        X_train = X_sequences[:split_idx]
+        y_train = y_sequences[:split_idx]
+        X_val = X_sequences[split_idx:]
+        y_val = y_sequences[split_idx:]
+        
+        # Convert to PyTorch tensors with correct shapes
+        X_train = torch.FloatTensor(X_train)  # Shape: (n_train, lookback, n_features)
+        y_train = torch.FloatTensor(y_train).view(-1, 1)  # Shape: (n_train, 1)
+        X_val = torch.FloatTensor(X_val)  # Shape: (n_val, lookback, n_features)
+        y_val = torch.FloatTensor(y_val).view(-1, 1)  # Shape: (n_val, 1)
+        
+        # Log final shapes
+        logger.info(f"Training data: X_train {X_train.shape}, y_train {y_train.shape}")
+        logger.info(f"Validation data: X_val {X_val.shape}, y_val {y_val.shape}")
+        
+        return X_train, y_train, X_val, y_val, feature_scaler, target_scaler, feature_column_names_for_model_input, features_df
+        
+    except Exception as e:
+        logger.error(f"Error in _get_and_prepare_training_data: {str(e)}")
+        raise
+
+@rate_limit(api_name='yfinance')
+def fetch_yfinance_data(symbol, period, interval, timeframe: str = None): # ADDED timeframe ARG
+    """Cached yfinance data fetch with improved error handling and data validation"""
+    try:
+        # This part still assumes direct yfinance call or that DataFetcher aligns
+        ticker_obj = yf.Ticker(f"{symbol.upper()}-USD")
+        data = ticker_obj.history(period=period, interval=interval, auto_adjust=True)
+
+        if data is None or data.empty:
+            error_id = error_tracker.track_error(
+                ValueError(f"Could not fetch yfinance data for {symbol}"),
+                ErrorSeverity.ERROR,
+                ErrorCategory.DATA_FETCH,
+                "yfinance_direct_fetcher", # Changed source
+                 metadata={"symbol": symbol, "period": period, "interval": interval}
+            )
+            # raise ValueError(f"Data fetch failed (Error ID: {error_id})") # Allow fallback
+            logger.error(f"YFinance direct fetch for {symbol} returned no data (Error ID: {error_id}).")
+            return pd.DataFrame()
+            
+        # Standardize column names
+        data.rename(columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"}, inplace=True, errors='ignore')
+        data.columns = data.columns.str.capitalize()
+
+        # Determine the correct timeframe key for DataValidator
+        validator_timeframe_key = timeframe # Use the passed 'timeframe' (e.g., "24h")
+        if not validator_timeframe_key or validator_timeframe_key not in settings.TIMEFRAME_MAP: # Use settings.TIMEFRAME_MAP
+            # Fallback or mapping if the main 'timeframe' isn't directly usable
+            # This logic might need to be more robust if 'interval' can be varied independently
+            logger.warning(f"Validator timeframe key '{validator_timeframe_key if validator_timeframe_key else 'None'}' is invalid or not in TIMEFRAME_MAP. Attempting to use 'interval' ('{interval}') or a default.")
+            # Simple fallback: if interval is a key, use it. Otherwise, try to map or use default.
+            if interval in settings.TIMEFRAME_MAP: # Use settings.TIMEFRAME_MAP
+                validator_timeframe_key = interval
+            else: # Last resort, try to find a match or use default. This could be improved.
+                compatible_key = next((k for k, v in settings.TIMEFRAME_MAP.items() if v.get("interval") == interval), None) # Use settings.TIMEFRAME_MAP
+                if compatible_key:
+                    validator_timeframe_key = compatible_key
+                else:
+                    validator_timeframe_key = settings.DEFAULT_TIMEFRAME # Or raise error
+                    logger.error(f"Could not map yfinance interval '{interval}' to a valid TIMEFRAME_MAP key. Using default: '{validator_timeframe_key}'")
+
+        logger.debug(f"DataValidator will use timeframe_key: '{validator_timeframe_key}' (derived from input timeframe: '{timeframe}', interval: '{interval}')")
+        validator = DataValidator(timeframe=validator_timeframe_key)
+        data, metrics = validator.validate_and_clean_data(data)
+        
+        if metrics.overall_quality < 0.7: 
+            error_id = error_tracker.track_error(
+                ValueError(f"Data quality below threshold. Metrics: {metrics.to_dict()}"),
+                ErrorSeverity.WARNING,
+                ErrorCategory.DATA_QUALITY,
+                "data_validator_yfinance",
+                metadata={"quality_metrics": metrics.to_dict()} 
+            )
+            logger.warning(f"Low quality data (Error ID: {error_id}). Metrics: {metrics.to_dict()}")
+            
+        return data
+        
+    except Exception as e:
+        error_id = error_tracker.track_error(
+            e, ErrorSeverity.ERROR,
+            ErrorCategory.DATA_FETCH,
+            "fetch_yfinance_data_general_error",
+            metadata={"symbol": symbol, "period": period, "interval": interval, "error_details": str(e)}
+        )
+        logger.error(f"Error fetching yfinance data (Error ID: {error_id}): {str(e)}")
+        # raise # Or return empty pd.DataFrame() to allow fallback
+        return pd.DataFrame()
+
+def check_server(timeout: int = 2) -> bool:
+    """Check if FastAPI server is running"""
+    try:
+        response = requests.get("http://localhost:8000/api/health", timeout=timeout)
+        return response.status_code == 200
+    except requests.exceptions.RequestException:
+        logger.error("FastAPI server is not running")
+        return False
+
+@rate_limit(api_name='coingecko')
+def fetch_coingecko_price(symbol: str):
+    """Fetch real-time price from CoinGecko with improved error handling"""
+    cache_key = f"price_{symbol}"
+    if cache_key in PRICE_CACHE:
+        logger.debug(f"Returning cached price for {symbol}")
+        return PRICE_CACHE[cache_key]
+
+    coin_id = COINGECKO_ID_MAP.get(symbol.upper())
+    if not coin_id:
+        error_id = error_tracker.track_error(
+            ValueError(f"No CoinGecko ID mapping for {symbol}"),
+            ErrorSeverity.ERROR,
+            ErrorCategory.DATA_FETCH,
+            "coingecko_fetcher"
+        )
+        logger.error(f"Invalid symbol (Error ID: {error_id})")
+        return None
+
+    url = f"{settings.COINGECKO_API_URL}/simple/price"
+    headers = {
+        'accept': 'application/json'
+    }
+    api_key = settings.COINGECKO_API_KEY.get_secret_value()
+    if api_key:
+        headers['x-cg-demo-api-key'] = api_key
+        
+    params = {
+        'ids': coin_id,
+        'vs_currencies': 'usd',
+        'include_24hr_change': 'true'
+    }
+
+    try:
+        response = requests.get(url, headers=headers, params=params, timeout=15)
+        
+        if response.status_code == 200:
+            data = response.json()
+            if coin_id in data and 'usd' in data[coin_id]:
+                price = float(data[coin_id]['usd'])
+                PRICE_CACHE[cache_key] = price
+                logger.debug(f"Fetched price from API for {symbol}: {price}")
+                return price
+        else:
+            error_message = f"API request failed with status {response.status_code}. Response: {response.text}"
+            error_id = error_tracker.track_error(
+                Exception(error_message),
+                ErrorSeverity.ERROR,
+                ErrorCategory.API,
+                "coingecko_api"
+            )
+            logger.error(f"API request failed (Error ID: {error_id})")
+            
+    except requests.exceptions.RequestException as e:
+        error_id = error_tracker.track_error(
+            e, ErrorSeverity.ERROR,
+            ErrorCategory.API,
+            "coingecko_api"
+        )
+        logger.error(f"API request error (Error ID: {error_id}): {str(e)}")
+
+    return None
+
+def fetch_coingecko_sentiment(symbol: str):
+    """Fetch sentiment from CoinGecko with improved error handling"""
+    cache_key = f"sentiment_{symbol}"
+    if cache_key in SENTIMENT_CACHE:
+        logger.debug(f"Returning cached sentiment for {symbol}")
+        return SENTIMENT_CACHE[cache_key]
+
+    coin_id = COINGECKO_ID_MAP.get(symbol.upper())
+    if not coin_id:
+        logger.warning(f"No CoinGecko mapping for symbol {symbol}, using default sentiment")
+        return 0.5
+
+    url = f"{settings.COINGECKO_API_URL}/coins/{coin_id}"
+    headers = {
+        'accept': 'application/json'
+    }
+    api_key = settings.COINGECKO_API_KEY.get_secret_value()
+    if api_key:
+        headers['x-cg-demo-api-key'] = api_key
+
+    try:
+        response = requests.get(url, headers=headers, timeout=15)
+        
+        if response.status_code == 200:
+            data = response.json()
+            sentiment = data.get('sentiment_votes_up_percentage', 50) / 100
+            logger.debug(f"Fetched sentiment from API for {symbol}: {sentiment}")
+            SENTIMENT_CACHE[cache_key] = sentiment
+            return sentiment
+        else:
+            error_message = f"API request failed with status {response.status_code}. Response: {response.text}"
+            logger.error(f"API request failed: {error_message}") # Simplified logging for now, can re-add ErrorTracker if needed
+            
+    except requests.exceptions.RequestException as e:
+        logger.error(f"API request error: {str(e)}") # Simplified logging for now
+
+    return 0.5  # Default neutral sentiment
+
+@rate_limit(api_name='coingecko') 
+def fetch_coingecko_fallback(coin_id, timeframe):
+    """Fallback to CoinGecko historical data with improved rate limiting"""
+    try:
+        # Use period from TIMEFRAME_MAP
+        days_str = settings.TIMEFRAME_MAP[timeframe].get('period', '30d') # Default to 30d if not found
+        days = int(days_str[:-1]) # Convert '30d' to 30
+        
+        mapped_coin_id = COINGECKO_ID_MAP.get(coin_id, coin_id.lower())
+        
+        url = f"{settings.COINGECKO_API_URL}/coins/{mapped_coin_id}/market_chart"
+        headers = {
+            'accept': 'application/json'
+        }
+        api_key = settings.COINGECKO_API_KEY.get_secret_value()
+        if api_key:
+            headers['x-cg-demo-api-key'] = api_key
+            
+        params = {
+            'vs_currency': 'usd',
+            'days': str(days),
+            'interval': 'hourly' if days <= 90 else 'daily'
+        }
+        
+        backoff = 1  # Initial backoff time in seconds
+        for attempt in range(MAX_RETRIES):
+            try:
+                resp = requests.get(url, headers=headers, params=params, timeout=15)
+                
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if not data or 'prices' not in data:
+                        logger.error(f"Invalid response format from CoinGecko for {coin_id}")
+                        return pd.DataFrame()
+                        
+                    # Convert data to DataFrame
+                    prices = data['prices']
+                    volumes = data.get('total_volumes', [[0, 0]] * len(prices))
+                    
+                    df = pd.DataFrame(prices, columns=['timestamp', 'price'])
+                    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
+                    df.set_index('timestamp', inplace=True)
+                    
+                    # Add volume data
+                    volume_df = pd.DataFrame(volumes, columns=['timestamp', 'volume'])
+                    volume_df['timestamp'] = pd.to_datetime(volume_df['timestamp'], unit='ms', utc=True)
+                    volume_df.set_index('timestamp', inplace=True)
+                    
+                    # Create OHLCV DataFrame
+                    final_df = pd.DataFrame(index=df.index)
+                    final_df['Close'] = df['price']
+                    final_df['Volume'] = volume_df['volume']
+                    final_df['Open'] = final_df['Close'].shift(1)
+                    final_df['High'] = final_df['Close'].rolling(2, min_periods=1).max()
+                    final_df['Low'] = final_df['Close'].rolling(2, min_periods=1).min()
+                    
+                    # Forward fill any missing data
+                    final_df = final_df.fillna(method='ffill').fillna(method='bfill')
+                    
+                    logger.debug(f"CoinGecko fallback fetched {len(final_df)} rows for {coin_id}")
+                    return final_df
+                    
+                elif resp.status_code == 429:  # Rate limit hit
+                    wait_time = backoff * (2 ** attempt)
+                    logger.warning(f"Rate limit hit, waiting {wait_time}s before retry")
+                    time.sleep(wait_time)
+                    continue
+                    
+                else:
+                    logger.error(f"CoinGecko fallback failed with status code {resp.status_code}")
+                    if attempt < MAX_RETRIES - 1:
+                        time.sleep(RETRY_DELAY)
+                        continue
+                    return pd.DataFrame()
+                    
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Request error on attempt {attempt + 1}: {str(e)}")
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(RETRY_DELAY)
+                    continue
+                    
+        logger.warning(f"CoinGecko fallback failed for {coin_id} after {MAX_RETRIES} attempts")
+        return pd.DataFrame()
+        
+    except Exception as e:
+        logger.error(f"CoinGecko fallback failed: {str(e)}")
+        return pd.DataFrame()
+
+async def get_latest_data(symbol: str, timeframe: str = "24h") -> pd.DataFrame: # ASYNC
+    try:
+        data_fetcher = DataFetcher()
+        data = await data_fetcher.get_merged_data(symbol, timeframe) # AWAITED
+        
+        if data is None or data.empty:
+            logger.error(f"Data fetch for {symbol} timeframe {timeframe} returned None or empty after get_merged_data.")
+            raise ValueError(f"Could not fetch sufficient data for {symbol} (timeframe: {timeframe}) after get_merged_data call.")
+
+        # Ensure TIMEFRAME_MAP from settings is used to get lookback
+        if timeframe not in settings.TIMEFRAME_MAP or "lookback" not in settings.TIMEFRAME_MAP[timeframe]:
+            logger.error(f"Timeframe '{timeframe}' or its lookback configuration not found in settings.TIMEFRAME_MAP.")
+            raise ValueError(f"Invalid timeframe configuration for {timeframe}.")
+            
+        required_lookback = settings.TIMEFRAME_MAP[timeframe]["lookback"]
+        
+        if len(data) < required_lookback:
+            logger.error(f"Insufficient data for {symbol} ({timeframe}): fetched {len(data)} points, but model requires lookback of {required_lookback} points.")
+            raise ValueError(f"Insufficient data points for {symbol} ({timeframe}) to meet model lookback requirement ({len(data)} < {required_lookback}).")
+            
+        logger.info(f"Successfully fetched sufficient data for {symbol}, timeframe {timeframe} in get_latest_data. Shape: {data.shape}, Lookback satisfied: {len(data)} >= {required_lookback}")
+        return data
+        
+    except ValueError as ve:
+        logger.error(f"ValueError in get_latest_data for {symbol} ({timeframe}): {str(ve)}", exc_info=True) 
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error in get_latest_data for {symbol} ({timeframe}): {type(e).__name__} - {str(e)}", exc_info=True)
+        raise ValueError(f"Unexpected error fetching latest data for {symbol} ({timeframe}) due to {type(e).__name__}.") from e
+
+def ensemble_prediction(symbol, timeframes=["1h", "4h", "24h"]):
+    """Combine predictions from multiple timeframes with dynamic weighting"""
+    predictions = {}
+    mape_scores = {}
+    for tf in timeframes:
+        result = predict_next_price(symbol, tf)
+        if "error" not in result:
+            predictions[tf] = result["predicted_price"]
+            mape_scores[tf] = result.get("mape", 100)
+    
+    if not predictions:
+        logger.error("No valid predictions for ensemble")
+        return predict_next_price(symbol, "24h")
+    
+    total_inverse_mape = sum(1 / max(mape, 1e-8) for mape in mape_scores.values())
+    weights = {tf: (1 / max(mape_scores[tf], 1e-8)) / total_inverse_mape for tf in predictions}
+    weighted_avg = sum(predictions[tf] * weights[tf] for tf in predictions)
+    
+    last_result = predict_next_price(symbol, "24h")
+    last_result["predicted_price"] = weighted_avg
+    last_result["ensemble"] = predictions
+    last_result["weights"] = weights
+    return last_result
+
+def fetch_market_data(symbol: str, timeframe: str):
+    """Fetch market data with improved error handling and fallback mechanisms"""
+    try:
+        logger.info(f"Fetching market data for {symbol} with timeframe {timeframe}")
+        
+        tf_config = settings.TIMEFRAME_MAP.get(timeframe) # Use settings.TIMEFRAME_MAP
+        if not tf_config:
+            raise ValueError(f"Invalid timeframe '{timeframe}' for TIMEFRAME_MAP in fetch_market_data")
+        
+        yfinance_period = tf_config.get("period")
+        yfinance_interval = tf_config.get("interval") # yfinance specific, e.g. "1d"
+
+        if not yfinance_period or not yfinance_interval:
+            raise ValueError(f"Missing period or interval for timeframe '{timeframe}' in TIMEFRAME_MAP")
+
+        logger.debug(f"Attempting to fetch data from yfinance for {symbol} using TIMEFRAME_MAP key '{timeframe}' (period: {yfinance_period}, interval: {yfinance_interval})")
+        # Pass the main 'timeframe' (e.g. "24h") to fetch_yfinance_data
+        primary_data = fetch_yfinance_data(symbol, period=yfinance_period, interval=yfinance_interval, timeframe=timeframe)
+        
+        # Validate primary data
+        if primary_data is not None and not primary_data.empty:
+            primary_data.timeframe = timeframe  # Add timeframe attribute for validation
+            if validate_data_quality(primary_data):
+                logger.info(f"Successfully fetched and validated {len(primary_data)} points from primary source")
+                return primary_data
+            else:
+                logger.warning("Primary data failed validation")
+        
+        # Try CoinGecko as fallback
+        logger.debug(f"Attempting to fetch data from CoinGecko for {symbol}")
+        coingecko_data = fetch_coingecko_fallback(symbol, timeframe)
+        
+        if coingecko_data is not None and not coingecko_data.empty:
+            coingecko_data.timeframe = timeframe  # Add timeframe attribute for validation
+            if validate_data_quality(coingecko_data):
+                logger.info(f"Successfully fetched and validated {len(coingecko_data)} points from CoinGecko")
+                return coingecko_data
+            else:
+                logger.warning("CoinGecko data failed validation")
+        
+        # If both sources failed, try to merge them
+        if primary_data is not None and coingecko_data is not None:
+            logger.info("Attempting to merge data from both sources")
+            merged_data = merge_data_sources(primary_data, coingecko_data)
+            merged_data.timeframe = timeframe
+            
+            if validate_data_quality(merged_data):
+                logger.info(f"Successfully merged and validated {len(merged_data)} points")
+                return merged_data
+        
+        raise ValueError(f"Could not fetch sufficient valid data for {symbol} with timeframe {timeframe}")
+        
+    except Exception as e:
+        logger.error(f"Error fetching market data: {str(e)}")
+        raise
+
+def merge_data_sources(primary_data: pd.DataFrame, secondary_data: pd.DataFrame) -> pd.DataFrame:
+    """Merge data from multiple sources with careful handling of overlaps and conflicts"""
+    try:
+        # Ensure both dataframes have datetime index
+        for df in [primary_data, secondary_data]:
+            if not isinstance(df.index, pd.DatetimeIndex):
+                df.index = pd.to_datetime(df.index)
+            if df.index.tz is None:
+                df.index = df.index.tz_localize('UTC')
+        
+        # Combine the data
+        combined = pd.concat([primary_data, secondary_data])
+        combined = combined[~combined.index.duplicated(keep='first')]
+        combined.sort_index(inplace=True)
+        
+        # Handle gaps
+        max_gap = pd.Timedelta(hours=24)
+        gaps = combined.index[1:] - combined.index[:-1]
+        large_gaps = gaps > max_gap
+        
+        if large_gaps.any():
+            logger.warning(f"Found {large_gaps.sum()} large gaps in merged data")
+            
+        # Interpolate missing values
+        combined = combined.interpolate(method='time', limit=3)
+        
+        # Validate final dataset
+        if len(combined) < len(primary_data) and len(combined) < len(secondary_data):
+            logger.warning("Merged dataset is smaller than both inputs")
+            
+        return combined
+        
+    except Exception as e:
+        logger.error(f"Error merging data sources: {str(e)}")
+        raise
+
+def detect_support_resistance(data: pd.DataFrame, window: int = 20, num_points: int = 5):
+    """Detect support and resistance levels using price action and volume"""
+    try:
+        highs = data['High'].values
+        lows = data['Low'].values
+        volumes = data['Volume'].values
+        
+        # Find local maxima and minima
+        resistance_points = []
+        support_points = []
+        
+        for i in range(window, len(data) - window):
+            # High points for resistance
+            if all(highs[i] >= highs[i-window:i]) and all(highs[i] >= highs[i+1:i+window+1]):
+                resistance_points.append((data.index[i], highs[i], volumes[i]))
+                
+            # Low points for support
+            if all(lows[i] <= lows[i-window:i]) and all(lows[i] <= lows[i+1:i+window+1]):
+                support_points.append((data.index[i], lows[i], volumes[i]))
+        
+        # Weight points by volume and recency
+        def weight_points(points):
+            if not points:
+                return []
+            weights = []
+            max_volume = max(p[2] for p in points)
+            latest_time = max(p[0] for p in points)
+            
+            for point in points:
+                volume_weight = point[2] / max_volume
+                time_weight = 1 - (latest_time - point[0]).total_seconds() / (86400 * 30)  # 30 days max
+                weights.append((point[1], volume_weight * time_weight))
+            
+            # Group close prices (within 2% range)
+            grouped = []
+            for price, weight in sorted(weights, key=lambda x: x[0]):
+                added = False
+                for i, (group_price, group_weight) in enumerate(grouped):
+                    if abs(price - group_price) / group_price < 0.02:
+                        grouped[i] = ((group_price * group_weight + price * weight) / (group_weight + weight),
+                                    group_weight + weight)
+                        added = True
+                        break
+                if not added:
+                    grouped.append((price, weight))
+            
+            # Sort by weight and take top points
+            return sorted([(price, weight) for price, weight in grouped], 
+                        key=lambda x: x[1], reverse=True)[:num_points]
+    
+        resistance_levels = weight_points(resistance_points)
+        support_levels = weight_points(support_points)
+        
+        return {
+            'resistance': [(float(price), float(weight)) for price, weight in resistance_levels],
+            'support': [(float(price), float(weight)) for price, weight in support_levels]
+        }
+        
+    except Exception as e:
+        logger.error(f"Error detecting support/resistance: {str(e)}")
+        return {'resistance': [], 'support': []}
+
+def calculate_prediction_probability(data: pd.DataFrame, prediction: float, model_confidence: float, 
+                                  support_resistance: dict, timeframe: str):
+    """Calculate probability metrics for the prediction"""
+    try:
+        current_price = data['Close'].iloc[-1]
+        
+        # Base probability from model confidence
+        base_prob = float(model_confidence)  # Ensure float conversion
+        
+        # Analyze support/resistance levels
+        price_probs = []
+        for level_type in ['support', 'resistance']:
+            for price, weight in support_resistance[level_type]:
+                # Ensure values are float
+                price = float(price)
+                weight = float(weight)
+                
+                # Calculate proximity to S/R level
+                proximity = abs(prediction - price) / price
+                if proximity < 0.02:  # Within 2% of S/R level
+                    signal_type = "bounce" if level_type == "support" and prediction > price else \
+                                  "reversal" if level_type == "resistance" and prediction < price else \
+                                  "breakout"
+                    price_probs.append({
+                        'type': level_type,
+                        'price': price,
+                        'strength': weight,
+                        'proximity': float(proximity),
+                        'signal': signal_type,
+                        'confidence': float(weight * (1 - proximity/0.02))
+                    })
+        
+        # Technical indicator probabilities
+        tech_probs = []
+        
+        # RSI Analysis
+        rsi_value = None
+        rsi_cols = ['RSI_14', 'RSI']
+        for col in rsi_cols:
+            if col in data.columns:
+                rsi_value = data[col].iloc[-1]
+                logger.info(f"[PREDICT_PROB] Using {col} column for RSI analysis. Value: {rsi_value}")
+                break
+        
+        if rsi_value is not None:
+            rsi_signal = {
+                'indicator': 'RSI',
+                'value': float(rsi_value),
+                'signal': 'overbought' if rsi_value > 70 else 'oversold' if rsi_value < 30 else 'neutral',
+                'strength': 0.7 if (rsi_value > 70 and prediction < current_price) or 
+                                    (rsi_value < 30 and prediction > current_price) else 0.3
+            }
+            tech_probs.append(rsi_signal)
+        
+        # MACD Analysis
+        if all(col in data.columns for col in ['MACD', 'MACD_Signal']):
+            macd = data['MACD'].iloc[-1]
+            macd_signal = data['MACD_Signal'].iloc[-1]
+            macd_prev = data['MACD'].iloc[-2]
+            macd_signal_prev = data['MACD_Signal'].iloc[-2]
+            
+            # Detect crossovers and trend strength
+            crossover = (macd > macd_signal and macd_prev < macd_signal_prev) or \
+                       (macd < macd_signal and macd_prev > macd_signal_prev)
+            trend_strength = abs(macd - macd_signal) / abs(macd_signal) if abs(macd_signal) > 0 else 0
+            
+            macd_signal = {
+                'indicator': 'MACD',
+                'value': float(macd),
+                'signal_line': float(macd_signal),
+                'signal': 'bullish_crossover' if macd > macd_signal and macd_prev < macd_signal_prev else
+                         'bearish_crossover' if macd < macd_signal and macd_prev > macd_signal_prev else
+                         'bullish_trend' if macd > macd_signal else 'bearish_trend',
+                'strength': 0.65 if crossover else 0.4 + min(0.3, trend_strength),
+                'trend_strength': float(trend_strength)
+            }
+            tech_probs.append(macd_signal)
+        
+        # Bollinger Bands Analysis
+        bb_cols = {
+            'upper': ['Bollinger_Upper', 'BB_upper'],
+            'lower': ['Bollinger_Lower', 'BB_lower'],
+            'middle': ['Bollinger_middle', 'BB_middle']
+        }
+        
+        bb_values = {}
+        for key, possible_cols in bb_cols.items():
+            for col in possible_cols:
+                if col in data.columns:
+                    bb_values[key] = data[col].iloc[-1]
+                    break
+        
+        if len(bb_values) >= 2:
+            bb_position = 'above_upper' if current_price > bb_values.get('upper', float('inf')) else \
+                         'below_lower' if current_price < bb_values.get('lower', float('-inf')) else \
+                         'within_bands'
+            
+            bb_signal = {
+                'indicator': 'BollingerBands',
+                'position': bb_position,
+                'signal': 'reversal' if (bb_position == 'above_upper' and prediction < current_price) or
+                                      (bb_position == 'below_lower' and prediction > current_price) else
+                         'continuation',
+                'strength': 0.6 if bb_position != 'within_bands' else 0.4,
+                'bandwidth': float(bb_values.get('upper', 0) - bb_values.get('lower', 0)) / \
+                           bb_values.get('middle', 1) if bb_values.get('middle', 0) != 0 else 0
+            }
+            tech_probs.append(bb_signal)
+        
+        # Volume Analysis
+        if 'Volume' in data.columns and len(data) >= 20:
+            vol_sma = data['Volume'].rolling(20).mean().iloc[-1]
+            current_vol = data['Volume'].iloc[-1]
+            vol_ratio = current_vol / vol_sma if vol_sma > 0 else 1.0
+            
+            volume_signal = {
+                'indicator': 'Volume',
+                'value': float(current_vol),
+                'sma': float(vol_sma),
+                'ratio': float(vol_ratio),
+                'signal': 'high' if vol_ratio > 1.5 else 'low' if vol_ratio < 0.5 else 'normal',
+                'strength': min(0.8, 0.4 + 0.2 * vol_ratio) if vol_ratio > 1 else \
+                           max(0.2, 0.4 - 0.2 * (1 - vol_ratio))
+            }
+            tech_probs.append(volume_signal)
+        
+        # Combine probabilities with weighted approach
+        combined_prob = base_prob
+        
+        # Weight the technical probabilities
+        if tech_probs:
+            tech_weight = min(0.6, 0.2 * len(tech_probs))  # Cap technical weight at 0.6
+            tech_prob = sum(p['strength'] for p in tech_probs) / len(tech_probs)
+            combined_prob = (combined_prob * (1 - tech_weight)) + (tech_prob * tech_weight)
+        
+        # Add support/resistance influence
+        if price_probs:
+            sr_weight = min(0.4, 0.15 * len(price_probs))  # Cap S/R weight at 0.4
+            sr_prob = sum(p['confidence'] for p in price_probs) / len(price_probs)
+            combined_prob = (combined_prob * (1 - sr_weight)) + (sr_prob * sr_weight)
+        
+        # Adjust for timeframe reliability
+        timeframe_factors = {
+            "1m": 0.7,
+            "5m": 0.75,
+            "15m": 0.8,
+            "30m": 0.85,
+            "1h": 0.9,
+            "4h": 0.95,
+            "24h": 1.0
+        }
+        timeframe_factor = timeframe_factors.get(timeframe, 0.85)
+        combined_prob *= timeframe_factor
+        
+        # Final probability capped between 0.1 and 0.95
+        final_prob = min(max(combined_prob, 0.1), 0.95)
+        
+        # Enhanced confidence factors with more detail
+        confidence_factors = {
+            'model_confidence': base_prob,
+            'price_levels': price_probs,
+            'technical_indicators': tech_probs,
+            'timeframe_factor': timeframe_factor,
+            'available_indicators': {
+                'rsi': rsi_value is not None,
+                'macd': 'MACD' in data.columns and 'MACD_Signal' in data.columns,
+                'bollinger': len(bb_values) >= 2,
+                'volume': 'Volume' in data.columns
+            },
+            'weights': {
+                'model': 1 - (tech_weight if tech_probs else 0) - (sr_weight if price_probs else 0),
+                'technical': tech_weight if tech_probs else 0,
+                'support_resistance': sr_weight if price_probs else 0
+            }
+        }
+        
+        return {
+            'probability': final_prob,
+            'confidence_factors': confidence_factors
+        }
+        
+    except Exception as e:
+        logger.error(f"Error calculating prediction probability: {str(e)}")
+        # Return a more informative default response
+        return {
+            'probability': 0.5,  # Neutral probability
+            'confidence_factors': {
+                'model_confidence': model_confidence,
+                'error': str(e),
+                'available_columns': list(data.columns) if isinstance(data, pd.DataFrame) else 'No DataFrame'
+            }
+        }
+
+async def predict_next_price(symbol, timeframe="24h"):
+    """Predict the next price for a given symbol and timeframe"""
+    try:
+        # Get model directory path
+        model_dir = os.path.join(MODEL_PATH, f"{symbol}_{timeframe}")
+        model_path = os.path.join(model_dir, "model.pth")
+        
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"No trained model found for {symbol} {timeframe}")
+        
+        # Load checkpoint with numpy scalar support
+        checkpoint = torch.load(model_path, map_location=torch.device('cpu'), weights_only=False)
+        
+        # Get model configuration
+        config = checkpoint.get('config', {})
+        if not config:
+            config = checkpoint.get('model_config', {})
+        
+        # Initialize model with loaded configuration
+        input_size = config.get('input_size', 26)
+        hidden_size = config.get('hidden_size', 128)
+        num_layers = config.get('num_layers', 2)
+        dropout = float(config.get('dropout', 0.3))
+        lookback = config.get('lookback', 72)
+        
+        # Initialize model
+        model = BiLSTMWithAttention(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout
+        )
+        
+        # Load model state
+        state_dict = checkpoint.get('model_state_dict', checkpoint)
+        if isinstance(state_dict, dict) and 'model_state_dict' in state_dict:
+            state_dict = state_dict['model_state_dict']
+        model.load_state_dict(state_dict)
+        model.eval()
+        
+        # Load scalers
+        feature_scaler = joblib.load(os.path.join(model_dir, "feature_scaler.joblib"))
+        target_scaler = joblib.load(os.path.join(model_dir, "target_scaler.joblib"))
+        
+        # Get latest data
+        latest_data = await get_latest_data(symbol, timeframe)
+        
+        if latest_data is None or len(latest_data) < lookback:
+            raise ValueError(f"Insufficient data points. Need at least {lookback} points.")
+        
+        # Prepare features
+        features_df, _ = await prepare_features(symbol, timeframe)
+        feature_list = get_feature_list_for_model(features_df)
+        features = features_df[feature_list].values
+        
+        # Scale features
+        scaled_features = feature_scaler.transform(features)
+        
+        # Create sequence for prediction (take last lookback points)
+        X = scaled_features[-lookback:].reshape(1, lookback, -1)  # Let reshape infer the last dimension
+        
+        # Convert to tensor and make prediction
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = model.to(device)
+        
+        with torch.no_grad():
+            X_tensor = torch.FloatTensor(X).to(device)
+            prediction = model(X_tensor)
+            prediction = prediction.cpu().numpy()
+        
+        # Inverse transform prediction
+        prediction_denorm = target_scaler.inverse_transform(prediction.reshape(-1, 1))
+        predicted_price = float(prediction_denorm[-1, 0])
+        
+        # Calculate confidence metrics
+        support_resistance = detect_support_resistance(latest_data)
+        probability = calculate_prediction_probability(
+            latest_data, 
+            predicted_price,
+            0.8,  # Model confidence
+            support_resistance,
+            timeframe
+        )
+        
+        # Get last actual price and next timestamp
+        last_price = float(latest_data['Close'].iloc[-1])
+        next_timestamp = get_next_timestamp(latest_data.index[-1], timeframe)
+        
+        # Prepare result
+        result = {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "predicted_price": predicted_price,
+            "last_price": last_price,
+            "prediction_time": next_timestamp.isoformat(),
+            "current_time": datetime.now(pytz.UTC).isoformat(),
+            "probability": probability.get('probability', 0.5),
+            "confidence_factors": probability.get('confidence_factors', {}),
+            "model_metrics": {
+                "lookback": lookback,
+                "input_size": input_size,
+                "hidden_size": hidden_size,
+                "num_layers": num_layers
+            }
+        }
+        
+        logger.info(f"Prediction result for {symbol} {timeframe}: {result}")
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error predicting price for {symbol} {timeframe}: {str(e)}")
+        raise
+
+def get_feature_list_for_model(features_df: pd.DataFrame) -> list[str]:
+    """Get the list of features to use for model input"""
+    # Define the core features we always want to include
+    core_features = ['Open', 'High', 'Low', 'Close', 'Volume']
+    
+    # Get technical indicators (columns that aren't core features)
+    technical_indicators = [col for col in features_df.columns if col not in core_features]
+    
+    # Combine core features and technical indicators
+    feature_list = core_features + technical_indicators
+    
+    logger.info(f"[GET_FEATURE_LIST] Using {len(feature_list)} features: {feature_list}")
+    return feature_list
+
+async def prepare_features(symbol: str, timeframe: str) -> tuple:
+    """Prepare features for model input with proper shapes"""
+    try:
+        # Get historical data
+        data_fetcher = DataFetcher()
+        df = await data_fetcher.get_merged_data(symbol, timeframe)
+        
+        if df is None or df.empty:
+            logger.error(f"Failed to fetch data for {symbol} {timeframe}")
+            raise ValueError(f"No data available for {symbol} {timeframe}")
+        
+        # Generate technical indicators
+        df_with_ta, _ = data_fetcher._add_technical_indicators(df.copy(), timeframe)
+        
+        if df_with_ta is None or df_with_ta.empty:
+            logger.error(f"Failed to generate features for {symbol} {timeframe}")
+            raise ValueError(f"Feature generation failed for {symbol} {timeframe}")
+        
+        # Ensure all required columns are present
+        required_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+        missing_columns = [col for col in required_columns if col not in df_with_ta.columns]
+        if missing_columns:
+            raise ValueError(f"Missing required columns: {missing_columns}")
+        
+        # Create target series (next period's close price)
+        target_series = df_with_ta['Close'].shift(-1)
+        
+        # Drop the last row since it won't have a target value
+        df_with_ta = df_with_ta[:-1]
+        target_series = target_series[:-1]
+        
+        # Ensure no NaN values
+        if df_with_ta.isna().any().any():
+            logger.warning("NaN values found in features, filling with forward fill then backward fill")
+            df_with_ta = df_with_ta.fillna(method='ffill').fillna(method='bfill')
+            
+        if target_series.isna().any():
+            logger.warning("NaN values found in target series, filling with forward fill then backward fill")
+            target_series = target_series.fillna(method='ffill').fillna(method='bfill')
+        
+        # Log shapes for debugging
+        logger.debug(f"Features shape: {df_with_ta.shape}")
+        logger.debug(f"Target shape: {target_series.shape}")
+        
+        return df_with_ta, target_series
+        
+    except Exception as e:
+        logger.error(f"Error in prepare_features: {str(e)}")
+        raise
+
+def check_data_drift(old_data, new_data, feature_names):
+    """Detect data drift using KS test with multiple features"""
+    if len(old_data) < 10 or len(new_data) < 10:
+        return True
+    # Only check first 8 features for efficiency, or all if less than 8
+    features_to_check = feature_names[:min(8, len(feature_names))]
+    for i, feature in enumerate(features_to_check):
+        stat, p = ks_2samp(old_data[:, i], new_data[:, i])
+        if p < 0.01:
+            logger.info(f"Data drift detected in feature {feature}")
+            return True
+    return False
+
+async def get_model(symbol, timeframe="24h", lookback=72):  # Default lookback is 72
+    """Get or train model for given symbol and timeframe, returning (model, feature_scaler, target_scaler, feature_names)"""
+    try:
+        # Add safe globals for model loading
+        torch.serialization.add_safe_globals([
+            torch.nn.modules.dropout.Dropout,
+            torch.nn.modules.rnn.LSTM,
+            torch.nn.modules.linear.Linear,
+            torch.nn.modules.container.ModuleList,
+            torch.nn.modules.activation.Tanh,
+            torch.nn.modules.activation.ReLU,
+            torch.nn.modules.normalization.LayerNorm,
+            BiLSTMWithAttention,
+            np.dtype,  # Add numpy dtype
+            np.bool_,  # Add numpy bool type
+            np.int64,  # Add numpy integer types
+            np.int32,
+            np.float64,  # Add numpy float types
+            np.float32,
+            np._core.multiarray.scalar,  # Add numpy scalar type
+            np.ndarray,  # Add numpy array type
+            np.dtypes.Float64DType,  # Add numpy float64 dtype
+            np.dtypes.Float32DType,  # Add numpy float32 dtype
+            np.dtypes.Int64DType,  # Add numpy int64 dtype
+            np.dtypes.Int32DType,  # Add numpy int32 dtype
+            np.dtypes.BoolDType,  # Add numpy bool dtype
+            np.dtypes.Complex64DType,  # Add numpy complex dtype
+            np.dtypes.Complex128DType  # Add numpy complex dtype
+        ])
+        
+        # Get training data (this is always done to get scalers and feature names, even if model exists)
+        X_train, y_train, X_val, y_val, feature_scaler, target_scaler, feature_names, features_df = await _get_and_prepare_training_data(
+            symbol, timeframe, lookback
+        )
+        
+        # Get model directory path
+        model_dir = os.path.join(MODEL_PATH, f"{symbol}_{timeframe}")
+        model_path = os.path.join(model_dir, "model.pth")
+        scaler_feature_path = os.path.join(model_dir, "feature_scaler.joblib")
+        scaler_target_path = os.path.join(model_dir, "target_scaler.joblib")
+        
+        # Get hyperparameters from TIMEFRAME_MAP or use defaults
+        timeframe_config = TIMEFRAME_MAP.get(timeframe, {})
+        input_size = X_train.shape[2]  # Number of features
+        hidden_size = timeframe_config.get('hidden_size', 128)
+        num_layers = timeframe_config.get('num_layers', 2)
+        dropout = timeframe_config.get('dropout', 0.3)
+        batch_size = timeframe_config.get('batch_size', 32)
+        learning_rate = timeframe_config.get('learning_rate', 1e-4)
+        max_lr = timeframe_config.get('max_lr', 2e-5)
+        
+        # Log complete hyperparameter configuration
+        logger.info(
+            f"Initializing {timeframe} model with configuration:\n"
+            f"Architecture: lookback={lookback}, input_size={input_size}, hidden_size={hidden_size}, "
+            f"num_layers={num_layers}, dropout={dropout}\n"
+            f"Training: batch_size={batch_size}, learning_rate={learning_rate}, max_lr={max_lr}, "
+            f"loss=HuberLoss, optimizer=AdamW, scheduler=OneCycleLR"
+        )
+        
+        # Try to load existing model
+        if os.path.exists(model_path) and os.path.exists(scaler_feature_path) and os.path.exists(scaler_target_path):
+            logger.info(f"Loading existing model from {model_dir}")
+            model = BiLSTMWithAttention(
+                input_size=input_size,
+                hidden_size=hidden_size,
+                num_layers=num_layers,
+                dropout=dropout
+            )
+                model.load_state_dict(torch.load(model_path)['model_state_dict'])
+                model.eval()
+                
+                # Load scalers
+                feature_scaler = joblib.load(scaler_feature_path)
+                target_scaler = joblib.load(scaler_target_path)
+                
+                return model, feature_scaler, target_scaler, feature_names
+        
+        # Create new model if loading failed or no model exists
+        logger.info(f"Creating new model with input_size={input_size}, hidden_size={hidden_size}, "
+                   f"num_layers={num_layers}, dropout={dropout}")
+        model = BiLSTMWithAttention(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout
+        )
+        
+        # Train model with optimized hyperparameters
+        model, training_history = train_model(
+            X_train, y_train,
+            X_val, y_val,
+            model, timeframe, symbol,
+            batch_size, learning_rate,
+            feature_names=feature_names,
+            feature_scaler=feature_scaler,
+            target_scaler=target_scaler
+        )
+        
+        # Save scalers alongside the model
+        os.makedirs(model_dir, exist_ok=True)
+        joblib.dump(feature_scaler, scaler_feature_path)
+        joblib.dump(target_scaler, scaler_target_path)
+        logger.info(f"Saved feature and target scalers to {model_dir}")
+        
+        # Return all four required values consistently
+        return model, feature_scaler, target_scaler, feature_names
+        
+    except Exception as e:
+        logger.error(f"Error in get_model: {str(e)}", exc_info=True)
+        raise
+
+def validate_data_quality(data: pd.DataFrame) -> bool:
+    """Validate data quality with comprehensive checks for training data"""
+    try:
+        if data.empty:
+            logger.error("Empty dataset")
+            return False
+            
+        # Check for minimum required data points based on timeframe
+        timeframe_min_points = {
+            "30m": 1000,  # ~2 weeks of data
+            "1h": 720,    # ~1 month of data
+            "4h": 360,    # ~2 months of data
+            "24h": 365    # 1 year of data
+        }
+        
+        timeframe = getattr(data, 'timeframe', '24h')  # Default to 24h if not specified
+        min_required = timeframe_min_points.get(timeframe, 1000)
+        
+        if len(data) < min_required:
+            logger.error(f"Insufficient data points for {timeframe}: {len(data)} < {min_required}")
+            return False
+            
+        # Check for missing values
+        missing_pct = data.isnull().sum() / len(data)
+        for column, pct in missing_pct.items():
+            if pct > 0.1:  # More than 10% missing in any column
+                logger.error(f"Too many missing values in {column}: {pct:.2%}")
+                return False
+            
+        # Check for price continuity and anomalies
+        price_changes = data['Close'].pct_change().abs()
+        max_allowed_change = {
+            "30m": 0.1,   # 10% max change for 30m
+            "1h": 0.15,   # 15% max change for 1h
+            "4h": 0.2,    # 20% max change for 4h
+            "24h": 0.3    # 30% max change for 24h
+        }
+        
+        max_change = max_allowed_change.get(timeframe, 0.3)
+        anomalies = price_changes[price_changes > max_change]
+        if len(anomalies) > 0:
+            logger.warning(f"Found {len(anomalies)} suspicious price changes > {max_change:.1%}")
+            if len(anomalies) > len(data) * 0.05:  # If more than 5% of data points are anomalous
+                logger.error("Too many anomalous price changes")
+                return False
+            
+        # Check for zero or negative prices
+        if (data['Close'] <= 0).any():
+            logger.error("Found zero or negative prices")
+            return False
+            
+        # Check for zero volume periods
+        zero_volume_pct = (data['Volume'] == 0).mean()
+        if zero_volume_pct > 0.1:  # More than 10% periods with zero volume
+            logger.error(f"Too many zero volume periods: {zero_volume_pct:.2%}")
+            return False
+            
+        # Ensure time series continuity
+        time_diffs = data.index.to_series().diff().dropna()
+        expected_diff = {
+            "30m": pd.Timedelta(minutes=30),
+            "1h": pd.Timedelta(hours=1),
+            "4h": pd.Timedelta(hours=4),
+            "24h": pd.Timedelta(days=1)
+        }
+        expected = expected_diff.get(timeframe)
+        if expected:
+            irregular_intervals = time_diffs != expected
+            if irregular_intervals.sum() > len(data) * 0.05:  # More than 5% irregular intervals
+                logger.error(f"Too many irregular time intervals for {timeframe}")
+                return False
+                
+        # Check data freshness
+        if isinstance(data.index, pd.DatetimeIndex):
+            last_timestamp = data.index[-1]
+            if pd.Timestamp.now(tz='UTC') - last_timestamp > pd.Timedelta(days=1):
+                logger.warning("Data may be stale - last timestamp is more than 1 day old")
+                
+        # Check for required features
+        required_features = ['Open', 'High', 'Low', 'Close', 'Volume']
+        missing_features = [f for f in required_features if f not in data.columns]
+        if missing_features:
+            logger.error(f"Missing required features: {missing_features}")
+            return False
+            
+        # Verify data types
+        expected_types = {
+            'Open': np.floating,
+            'High': np.floating,
+            'Low': np.floating,
+            'Close': np.floating,
+            'Volume': np.floating
+        }
+        for col, expected_type in expected_types.items():
+            if not np.issubdtype(data[col].dtype, expected_type):
+                logger.error(f"Incorrect data type for {col}: expected {expected_type}, got {data[col].dtype}")
+                return False
+                
+        return True
+            
+    except Exception as e:
+        logger.error(f"Data validation error: {str(e)}")
+        return False
+
+def mean_absolute_percentage_error(y_true, y_pred):
+    """Calculate mean absolute percentage error"""
+    y_true = np.array(y_true).ravel()
+    y_pred = np.array(y_pred).ravel()
+    return np.mean(np.abs((y_true - y_pred) / y_true)) * 100
+
+def get_data_stats(data_tensor: torch.Tensor, target_tensor: torch.Tensor) -> dict:
+    """Calculate basic statistics for data and target tensors."""
+    try:
+        if data_tensor is None or target_tensor is None:
+            return {
+                'X_mean': float('nan'),
+                'X_std': float('nan'),
+                'y_mean': float('nan'),
+                'y_std': float('nan')
+            }
+        
+        # Ensure tensors are on CPU for numpy operations
+        if torch.is_tensor(data_tensor):
+            data_tensor = data_tensor.cpu()
+        if torch.is_tensor(target_tensor):
+            target_tensor = target_tensor.cpu()
+            
+        return {
+            'X_mean': float(torch.mean(data_tensor).item()),
+            'X_std': float(torch.std(data_tensor).item()),
+            'y_mean': float(torch.mean(target_tensor).item()),
+            'y_std': float(torch.std(target_tensor).item())
+        }
+    except Exception as e:
+        logger.error(f"Error in get_data_stats: {str(e)}")
+        return {
+            'X_mean': float('nan'),
+            'X_std': float('nan'),
+            'y_mean': float('nan'),
+            'y_std': float('nan')
+        }
+
+def train_model(X_train, y_train, X_val, y_val, model, timeframe, symbol, batch_size, learning_rate, feature_names=None, feature_scaler=None, target_scaler=None):
+    """Train the model with proper tensor handling and advanced training techniques"""
+    try:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = model.to(device)
+        
+        # Ensure input tensors have correct shape and are on the right device
+        X_train = X_train.to(device)  # Shape: (batch, seq_len, features)
+        y_train = y_train.to(device)  # Shape: (batch, 1)
+        X_val = X_val.to(device)      # Shape: (batch, seq_len, features)
+        y_val = y_val.to(device)      # Shape: (batch, 1)
+        
+        # Log tensor shapes and dimensions before DataLoader
+        logger.info(f"Input tensor shapes before DataLoader:")
+        logger.info(f"X_train: shape={X_train.shape}, dim={X_train.dim()}")
+        logger.info(f"y_train: shape={y_train.shape}, dim={y_train.dim()}")
+        logger.info(f"X_val: shape={X_val.shape}, dim={X_val.dim()}")
+        logger.info(f"y_val: shape={y_val.shape}, dim={y_val.dim()}")
+        
+        # Ensure tensors have correct dimensions for DataLoader
+        if X_train.dim() == 2: X_train = X_train.unsqueeze(0) 
+        if X_val.dim() == 2: X_val = X_val.unsqueeze(0)
+        if y_train.dim() == 1: y_train = y_train.unsqueeze(1)
+        if y_val.dim() == 1: y_val = y_val.unsqueeze(1)
+            
+        # Log tensor shapes after potential dimension adjustment for DataLoader
+        logger.info(f"Tensor shapes after potential adjustment for DataLoader:")
+        logger.info(f"X_train: shape={X_train.shape}, dim={X_train.dim()}")
+        logger.info(f"y_train: shape={y_train.shape}, dim={y_train.dim()}")
+        logger.info(f"X_val: shape={X_val.shape}, dim={X_val.dim()}")
+        logger.info(f"y_val: shape={y_val.shape}, dim={y_val.dim()}")
+        
+        # Create data loaders 
+        train_dataset = TensorDataset(X_train, y_train) 
+        val_dataset = TensorDataset(X_val, y_val)
+        
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size)
+        
+        # Initialize optimizer with weight decay
+        optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
+        
+        # Get max_lr from config for scheduler and logging
+        current_max_lr = TIMEFRAME_MAP[timeframe].get('max_lr', 5e-5)
+
+        # Learning rate scheduler
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=current_max_lr, # Use configured max_lr
+            epochs=EPOCHS, # Use constant EPOCHS
+            steps_per_epoch=len(train_loader),
+            pct_start=0.3,
+            anneal_strategy='cos'
+        )
+        
+        # Initialize early stopping with increased patience
+        early_stopping = EarlyStopping(patience=TIMEFRAME_MAP[timeframe].get('early_stopping_patience', 40), min_delta=1e-4)
+        
+        # Training history
+        history = {
+            'train_loss': [], 'val_loss': [], 'val_mape': [], 'val_r2': [], 'learning_rates': []
+        }
+        
+        # Training loop
+        best_val_loss = float('inf')
+        best_model_state = None
+        best_epoch = -1
+        best_metrics = None
+        
+        logger.info(f"Starting training for {symbol} ({timeframe}) with: batch_size={batch_size}, initial_lr={learning_rate}, max_lr(OneCycle)={current_max_lr:.2e}, loss=HuberLoss, optimizer=AdamW")
+        
+        for epoch in range(EPOCHS):  # Use constant EPOCHS
+            model.train()
+            train_losses = []
+            
+            for batch_X, batch_y in train_loader:
+                optimizer.zero_grad()
+                outputs = model(batch_X) # Expected shape: (batch_size, 1)
+                
+                outputs_squeezed = outputs.squeeze(-1) 
+                batch_y_squeezed = batch_y.squeeze(-1) 
+
+                if outputs_squeezed.shape != batch_y_squeezed.shape:
+                    logger.warning(f"Shape mismatch for loss: outputs {outputs_squeezed.shape}, targets {batch_y_squeezed.shape}")
+                
+                loss = F.huber_loss(outputs_squeezed, batch_y_squeezed, reduction='mean', delta=1.0)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                scheduler.step()
+                train_losses.append(loss.item())
+            
+            model.eval()
+            val_losses = []
+            val_predictions_scaled = []
+            val_actuals_scaled = []
+            
+            with torch.no_grad():
+                for batch_X, batch_y in val_loader:
+                    outputs = model(batch_X)
+                    outputs_squeezed = outputs.squeeze(-1)
+                    batch_y_squeezed = batch_y.squeeze(-1)
+                    
+                    val_loss = F.huber_loss(outputs_squeezed, batch_y_squeezed, reduction='mean', delta=1.0)
+                    val_losses.append(val_loss.item())
+                    val_predictions_scaled.extend(outputs_squeezed.cpu().numpy())
+                    val_actuals_scaled.extend(batch_y_squeezed.cpu().numpy())
+            
+            avg_train_loss = np.mean(train_losses)
+            avg_val_loss = np.mean(val_losses)
+            
+            if target_scaler:
+                val_predictions_denorm = target_scaler.inverse_transform(np.array(val_predictions_scaled).reshape(-1, 1)).ravel()
+                val_actuals_denorm = target_scaler.inverse_transform(np.array(val_actuals_scaled).reshape(-1, 1)).ravel()
+            else:
+                val_predictions_denorm = np.array(val_predictions_scaled)
+                val_actuals_denorm = np.array(val_actuals_scaled)
+            
+            safe_actuals = np.where(val_actuals_denorm == 0, 1e-8, val_actuals_denorm)
+            val_mape = np.mean(np.abs((val_actuals_denorm - val_predictions_denorm) / safe_actuals)) * 100
+            val_r2 = r2_score(val_actuals_denorm, val_predictions_denorm)
+            
+            history['train_loss'].append(avg_train_loss)
+            history['val_loss'].append(avg_val_loss)
+            history['val_mape'].append(val_mape)
+            history['val_r2'].append(val_r2)
+            history['learning_rates'].append(scheduler.get_last_lr()[0])
+            
+            logger.info(f"Epoch {epoch}/{EPOCHS-1} - Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, "
+                       f"Val MAPE: {val_mape:.2f}%, Val R2: {val_r2:.4f}, LR: {scheduler.get_last_lr()[0]:.2e}")
+            
+            # Update best model state if this epoch has the lowest validation loss
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                best_model_state = copy.deepcopy(model.state_dict())  # Deep copy to ensure we preserve the best state
+                best_epoch = epoch
+                best_metrics = {
+                    'val_loss': avg_val_loss,
+                    'val_mape': val_mape,
+                    'val_r2': val_r2,
+                    'learning_rate': scheduler.get_last_lr()[0]
+                }
+                
+                # Save the best model checkpoint immediately when we find a better one
+                model_dir = os.path.join(MODEL_PATH, f"{symbol}_{timeframe}")
+                os.makedirs(model_dir, exist_ok=True)
+                checkpoint = {
+                    'model_state_dict': best_model_state,
+                    'config': {
+                        'input_size': model.input_size,
+                        'hidden_size': model.hidden_size,
+                        'num_layers': model.num_layers,
+                        'dropout': model.dropout_rate,
+                        'feature_list': feature_names,
+                        'lookback': X_train.size(1),
+                        'best_epoch': best_epoch,
+                        'best_metrics': best_metrics
+                    }
+                }
+                torch.save(checkpoint, os.path.join(model_dir, "model.pth"))
+                logger.info(f"Found new best model at epoch {best_epoch} "
+                          f"(Val Loss: {avg_val_loss:.4f}, MAPE: {val_mape:.2f}%, R2: {val_r2:.4f})")
+            
+            if early_stopping.step(avg_val_loss):
+                logger.info(f"Early stopping triggered at epoch {epoch}")
+                break
+        
+        # Always load the best model state at the end of training
+        if best_model_state is not None:
+            model.load_state_dict(best_model_state)
+            logger.info(f"Loaded best model state from epoch {best_epoch} with metrics: "
+                      f"Val Loss: {best_metrics['val_loss']:.4f}, MAPE: {best_metrics['val_mape']:.2f}%, "
+                      f"R2: {best_metrics['val_r2']:.4f}")
+        
+        return model, history
+        
+    except Exception as e:
+        logger.error(f"Error in train_model for {symbol} {timeframe}: {str(e)}", exc_info=True)
+        raise
+
+def monitor_gradients(model):
+    """Monitor gradient statistics during training"""
+    try:
+        grad_stats = {}
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                grad_stats[name] = {
+                    'mean': float(param.grad.mean().item()),
+                    'std': float(param.grad.std().item()),
+                    'norm': float(param.grad.norm().item())
+                }
+                
+                # Check for vanishing/exploding gradients
+                if grad_stats[name]['norm'] < 1e-7:
+                    logger.warning(f"Possible vanishing gradients in {name}")
+                elif grad_stats[name]['norm'] > 1e3:
+                    logger.warning(f"Possible exploding gradients in {name}")
+        
+        return grad_stats
+    except Exception as e:
+        logger.error(f"Error monitoring gradients: {str(e)}")
+        return {}
+
+def save_training_curves(train_losses, val_losses, val_mapes, val_rmses, val_r2s, model_dir):
+    """Save training curves data to JSON file"""
+    try:
+        curves_data = {
+            'train_losses': [float(x) for x in train_losses],
+            'val_losses': [float(x) for x in val_losses],
+            'val_mapes': [float(x) for x in val_mapes],
+            'val_rmses': [float(x) for x in val_rmses],
+            'val_r2s': [float(x) for x in val_r2s]
+        }
+        
+        curves_file = os.path.join(model_dir, 'training_curves.json')
+        with open(curves_file, 'w') as f:
+            json.dump(curves_data, f, indent=4)
+            
+        logger.info(f"Saved training curves to {curves_file}")
+    except Exception as e:
+        logger.error(f"Error saving training curves: {str(e)}")
+        # Don't raise the error since this is not critical for model operation
+
+def prepare_data_for_prediction(data: pd.DataFrame, timeframe: str) -> tuple:
+    """Prepare data for prediction using enhanced preprocessing pipeline"""
+    try:
+        logger.info("Starting data preparation pipeline")
+        
+        # Initialize preprocessor and augmentor
+        preprocessor = DataPreprocessor(timeframe)
+        augmentor = DataAugmentor(timeframe)
+        
+        # 1. Preprocess data
+        logger.info("Running preprocessing pipeline")
+        processed_data = preprocessor.process(data)
+        
+        # 2. Add engineered features
+        logger.info("Running feature engineering and augmentation")
+        augmented_data = augmentor.process(processed_data)
+        
+        # 3. Prepare features and target
+        feature_cols = [col for col in augmented_data.columns if col != 'target']
+        X = augmented_data[feature_cols].values
+        y = augmented_data['Close'].values
+        
+        # 4. Create sequences for LSTM
+        lookback = settings.TIMEFRAME_MAP[timeframe]["lookback"]
+        X_sequences = []
+        y_sequences = []
+        
+        for i in range(len(X) - lookback):
+            X_sequences.append(X[i:i+lookback])
+            y_sequences.append(y[i+lookback])
+            
+        X_sequences = np.array(X_sequences)
+        y_sequences = np.array(y_sequences)
+        
+        # 5. Split data
+        split_idx = int(len(X_sequences) * (1 - VALIDATION_SPLIT))
+        X_train = X_sequences[:split_idx]
+        X_val = X_sequences[split_idx:]
+        y_train = y_sequences[:split_idx]
+        y_val = y_sequences[split_idx:]
+        
+        # 6. Verify data quality
+        if len(X_train) < 100 or len(X_val) < 20:
+            raise ValueError(f"Insufficient data after sequence creation: train={len(X_train)}, val={len(X_val)}")
+            
+        # Log data shapes and basic statistics
+        logger.info(f"Training set shape: {X_train.shape}")
+        logger.info(f"Validation set shape: {X_val.shape}")
+        logger.info(f"Number of features: {X_train.shape[2]}")
+        logger.info(f"Feature names: {feature_cols}")
+        
+        # Calculate and log basic statistics
+        train_stats = {
+            'mean': np.mean(y_train),
+            'std': np.std(y_train),
+            'min': np.min(y_train),
+            'max': np.max(y_train)
+        }
+        logger.info(f"Training set statistics: {train_stats}")
+        
+        return X_train, X_val, y_train, y_val, preprocessor.feature_scalers
+        
+    except Exception as e:
+        logger.error(f"Error in data preparation: {str(e)}")
+        raise
+
+def calculate_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Calculate technical indicators for the given DataFrame"""
+    # Add basic price data if not present
+    if 'High' not in df.columns:
+        df['High'] = df['Close']
+    if 'Low' not in df.columns:
+        df['Low'] = df['Close']
+    if 'Open' not in df.columns:
+        df['Open'] = df['Close'].shift(1)
+    if 'Volume' not in df.columns:
+        df['Volume'] = 0
+
+    # Default windows for indicators
+    sma_window = 20
+    ema_span = 12
+    bb_window = 20
+    rsi_window = 14
+    momentum_window = 10
+    volatility_window = 20
+    adx_window = 14
+    cci_window = 20
+    epsilon = 1e-10  # Small value to prevent division by zero
+
+    # Technical Indicators
+    # SMA
+    df['SMA'] = df['Close'].rolling(window=sma_window).mean()
+    
+    # EMA
+    df['EMA'] = df['Close'].ewm(span=ema_span, adjust=False).mean()
+    
+    # RSI
+    delta = df['Close'].diff()
+    gain = delta.where(delta > 0, 0).rolling(window=rsi_window).mean()
+    loss = -delta.where(delta < 0, 0).rolling(window=rsi_window).mean()
+    rs = gain / (loss + epsilon)  # Add epsilon to prevent division by zero
+    df['RSI'] = 100 - (100 / (1 + rs))
+    
+    # MACD
+    df['MACD'] = df['Close'].ewm(span=ema_span, adjust=False).mean() - df['Close'].ewm(span=ema_span*2, adjust=False).mean()
+    
+    # Bollinger Bands
+    bb_middle = df['Close'].rolling(window=bb_window).mean()
+    bb_std = df['Close'].rolling(window=bb_window).std()
+    df['Bollinger_middle'] = bb_middle
+    df['Bollinger_Upper'] = bb_middle + 2 * bb_std
+    df['Bollinger_Lower'] = bb_middle - 2 * bb_std
+    
+    # ATR
+    df['ATR'] = ((df['High'] - df['Low']).rolling(rsi_window).mean() + 
+                 (df['High'] - df['Close'].shift()).abs().rolling(rsi_window).mean() + 
+                 (df['Low'] - df['Close'].shift()).abs().rolling(rsi_window).mean()) / 3
+    
+    # OBV
+    df['OBV'] = (np.sign(df['Close'].diff()) * df['Volume']).cumsum()
+    
+    # VWAP
+    df['VWAP'] = (df['Volume'] * (df['High'] + df['Low'] + df['Close']) / 3).cumsum() / (df['Volume'].cumsum() + epsilon)
+    
+    # Momentum
+    df['Momentum'] = df['Close'].diff(momentum_window)
+    
+    # Volatility
+    df['Volatility'] = df['Close'].rolling(window=volatility_window).std()
+    
+    # Lag1
+    df['Lag1'] = df['Close'].shift(1)
+    
+    # Sentiment_Up (placeholder - should be updated with actual sentiment data)
+    df['Sentiment_Up'] = 0.5  # Default neutral sentiment
+    
+    # ADX
+    plus_dm = df['High'].diff()
+    minus_dm = df['Low'].diff()
+    plus_dm[plus_dm < 0] = 0
+    minus_dm[minus_dm > 0] = 0
+    tr = pd.DataFrame(
+        [df['High'] - df['Low'],
+         (df['High'] - df['Close'].shift(1)).abs(),
+         (df['Low'] - df['Close'].shift(1)).abs()
+        ]).max()
+    atr = tr.rolling(window=adx_window).mean()
+    plus_di = 100 * (plus_dm.rolling(window=adx_window).mean() / (atr + epsilon))
+    minus_di = 100 * (minus_dm.rolling(window=adx_window).mean() / (atr + epsilon))
+    dx = 100 * ((plus_di - minus_di).abs() / (plus_di + minus_di + epsilon))
+    df['ADX'] = dx.rolling(window=adx_window).mean()
+    
+    # CCI
+    typical_price = (df['High'] + df['Low'] + df['Close']) / 3
+    mean_dev = pd.Series(0.0, index=df.index)
+    for i in range(cci_window, len(df)):
+        mean_dev[i] = sum(abs(typical_price[i-cci_window+1:i+1] - 
+                            typical_price[i-cci_window+1:i+1].mean())) / cci_window
+    df['CCI'] = (typical_price - typical_price.rolling(window=cci_window).mean()) / (0.015 * (mean_dev + epsilon))
+    
+    # Handle missing values
+    df = df.fillna(method='ffill').fillna(method='bfill')
+    
+    # Replace infinite values with NaN and then fill them
+    df = df.replace([np.inf, -np.inf], np.nan)
+    df = df.fillna(method='ffill').fillna(method='bfill')
+    
+    return df
+
+def monitor_training_data_quality(model, X_train, y_train, X_val, y_val, epoch):
+    """Monitor training data quality metrics"""
+    try:
+        # Convert numpy arrays to tensors if needed
+        if isinstance(X_train, np.ndarray):
+            X_train = torch.FloatTensor(X_train)
+        if isinstance(y_train, np.ndarray):
+            y_train = torch.FloatTensor(y_train)
+        if isinstance(X_val, np.ndarray):
+            X_val = torch.FloatTensor(X_val)
+        if isinstance(y_val, np.ndarray):
+            y_val = torch.FloatTensor(y_val)
+            
+        # Basic data statistics
+        train_stats = {
+            'X_mean': float(X_train.mean().item()),
+            'X_std': float(X_train.std().item()),
+            'y_mean': float(y_train.mean().item()),
+            'y_std': float(y_train.std().item())
+        }
+        
+        val_stats = {
+            'X_mean': float(X_val.mean().item()),
+            'X_std': float(X_val.std().item()),
+            'y_mean': float(y_val.mean().item()),
+            'y_std': float(y_val.std().item())
+        }
+        
+        logger.info(f"Epoch {epoch} - Training Data Stats: {train_stats}")
+        logger.info(f"Epoch {epoch} - Validation Data Stats: {val_stats}")
+        
+    except Exception as e:
+        logger.error(f"Error monitoring training data quality: {str(e)}")
+        # Don't raise the error since this is not critical for model operation
+
+class DataPreprocessor:
+    """Comprehensive data preprocessing pipeline"""
+    def __init__(self, timeframe: str):
+        self.timeframe = timeframe
+        self.scaler = None
+        self.feature_scalers = {}
+        self.outlier_thresholds = {}
+        
+    def detect_outliers(self, data: pd.DataFrame, feature: str, n_std: float = 3) -> pd.Series:
+        """Detect outliers using z-score method"""
+        z_scores = np.abs((data[feature] - data[feature].mean()) / data[feature].std())
+        return z_scores > n_std
+        
+    def handle_outliers(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Handle outliers in price and volume data"""
+        try:
+            df = data.copy()
+            
+            # Define features to check for outliers
+            price_features = ['Open', 'High', 'Low', 'Close']
+            volume_features = ['Volume']
+            
+            # Handle price outliers
+            for feature in price_features:
+                outliers = self.detect_outliers(df, feature)
+                if outliers.any():
+                    logger.warning(f"Found {outliers.sum()} outliers in {feature}")
+                    # Use rolling median to replace outliers
+                    window = 5 if self.timeframe in ["30m", "1h"] else 3
+                    df.loc[outliers, feature] = df[feature].rolling(window=window, center=True).median()
+            
+            # Handle volume outliers
+            for feature in volume_features:
+                outliers = self.detect_outliers(df, feature, n_std=4)  # More permissive for volume
+                if outliers.any():
+                    logger.warning(f"Found {outliers.sum()} outliers in {feature}")
+                    # Use rolling median for volume outliers
+                    window = 5 if self.timeframe in ["30m", "1h"] else 3
+                    df.loc[outliers, feature] = df[feature].rolling(window=window, center=True).median()
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error handling outliers: {str(e)}")
+            return data
+            
+    def normalize_features(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Normalize features using appropriate scaling methods"""
+        try:
+            df = data.copy()
+            
+            # Price features - use robust scaling
+            price_features = ['Open', 'High', 'Low', 'Close']
+            if 'price_scaler' not in self.feature_scalers:
+                self.feature_scalers['price_scaler'] = RobustScaler()
+                price_data = df[price_features].values
+                self.feature_scalers['price_scaler'].fit(price_data)
+            df[price_features] = self.feature_scalers['price_scaler'].transform(df[price_features])
+            
+            # Volume features - use log transformation and robust scaling
+            volume_features = ['Volume']
+            df[volume_features] = np.log1p(df[volume_features])
+            if 'volume_scaler' not in self.feature_scalers:
+                self.feature_scalers['volume_scaler'] = RobustScaler()
+                volume_data = df[volume_features].values
+                self.feature_scalers['volume_scaler'].fit(volume_data)
+            df[volume_features] = self.feature_scalers['volume_scaler'].transform(df[volume_features])
+            
+            # Technical indicators - use standard scaling
+            tech_features = [f for f in df.columns if f not in price_features + volume_features]
+            if tech_features:
+                if 'tech_scaler' not in self.feature_scalers:
+                    self.feature_scalers['tech_scaler'] = RobustScaler()
+                    tech_data = df[tech_features].values
+                    self.feature_scalers['tech_scaler'].fit(tech_data)
+                df[tech_features] = self.feature_scalers['tech_scaler'].transform(df[tech_features])
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error normalizing features: {str(e)}")
+            return data
+            
+    def add_temporal_features(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Add temporal features based on timeframe"""
+        try:
+            df = data.copy()
+            
+            # Ensure index is datetime
+            if not isinstance(df.index, pd.DatetimeIndex):
+                df.index = pd.to_datetime(df.index)
+            
+            # Add cyclical time features
+            if self.timeframe in ["30m", "1h"]:
+                # Hour of day - cyclical encoding
+                df['hour_sin'] = np.sin(2 * np.pi * df.index.hour / 24)
+                df['hour_cos'] = np.cos(2 * np.pi * df.index.hour / 24)
+                
+                # Day of week - cyclical encoding
+                df['day_sin'] = np.sin(2 * np.pi * df.index.dayofweek / 7)
+                df['day_cos'] = np.cos(2 * np.pi * df.index.dayofweek / 7)
+            
+            if self.timeframe in ["4h", "24h"]:
+                # Day of month - cyclical encoding
+                df['dom_sin'] = np.sin(2 * np.pi * df.index.day / 31)
+                df['dom_cos'] = np.cos(2 * np.pi * df.index.day / 31)
+                
+                # Month - cyclical encoding
+                df['month_sin'] = np.sin(2 * np.pi * df.index.month / 12)
+                df['month_cos'] = np.cos(2 * np.pi * df.index.month / 12)
+            
+            # Add trend features
+            df['trend'] = np.arange(len(df)) / len(df)
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error adding temporal features: {str(e)}")
+            return data
+            
+    def handle_missing_data(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Handle missing data with sophisticated methods"""
+        try:
+            df = data.copy()
+            
+            # Check for missing values
+            missing = df.isnull().sum()
+            if missing.any():
+                logger.warning(f"Found missing values: {missing[missing > 0]}")
+                
+                # For each column with missing values
+                for column in df.columns[df.isnull().any()]:
+                    missing_pct = df[column].isnull().mean()
+                    
+                    if missing_pct < 0.05:  # Less than 5% missing
+                        # Use interpolation for price data
+                        if column in ['Open', 'High', 'Low', 'Close']:
+                            df[column] = df[column].interpolate(method='time')
+                        # Use forward fill for volume
+                        elif column == 'Volume':
+                            df[column] = df[column].fillna(method='ffill')
+                        # Use interpolation for technical indicators
+                        else:
+                            df[column] = df[column].interpolate(method='linear')
+                    else:
+                        logger.error(f"Too many missing values in {column}: {missing_pct:.2%}")
+                        raise ValueError(f"Column {column} has too many missing values")
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error handling missing data: {str(e)}")
+            return data
+            
+    def process(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Run the complete preprocessing pipeline"""
+        try:
+            df = data.copy()
+            
+            # 1. Handle missing data
+            df = self.handle_missing_data(df)
+            
+            # 2. Handle outliers
+            df = self.handle_outliers(df)
+            
+            # 3. Add temporal features
+            df = self.add_temporal_features(df)
+            
+            # 4. Calculate technical indicators
+            df = calculate_technical_indicators(df)
+            
+            # 5. Normalize features
+            df = self.normalize_features(df)
+            
+            # Final validation
+            if not validate_data_quality(df):
+                raise ValueError("Data failed final validation after preprocessing")
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error in preprocessing pipeline: {str(e)}")
+            raise
+
+class DataAugmentor:
+    """Advanced feature engineering and data augmentation"""
+    def __init__(self, timeframe: str):
+        self.timeframe = timeframe
+        self.feature_importance = {}
+        
+    def add_price_patterns(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Add candlestick pattern features"""
+        try:
+            df = data.copy()
+            
+            # Basic candlestick features
+            df['body_size'] = df['Close'] - df['Open']
+            df['upper_shadow'] = df['High'] - df[['Open', 'Close']].max(axis=1)
+            df['lower_shadow'] = df[['Open', 'Close']].min(axis=1) - df['Low']
+            df['body_to_shadow_ratio'] = df['body_size'].abs() / (df['upper_shadow'] + df['lower_shadow'] + 1e-8)
+            
+            # Candlestick patterns
+            df['doji'] = (abs(df['body_size']) <= 0.1 * (df['High'] - df['Low'])).astype(float)
+            df['hammer'] = ((df['lower_shadow'] > 2 * abs(df['body_size'])) & 
+                          (df['upper_shadow'] <= 0.2 * df['lower_shadow'])).astype(float)
+            df['shooting_star'] = ((df['upper_shadow'] > 2 * abs(df['body_size'])) & 
+                                 (df['lower_shadow'] <= 0.2 * df['upper_shadow'])).astype(float)
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error adding price patterns: {str(e)}")
+            return data
+            
+    def add_volatility_features(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Add advanced volatility features"""
+        try:
+            df = data.copy()
+            
+            # Parkinson volatility
+            df['parkinson_vol'] = np.sqrt(1 / (4 * np.log(2)) * 
+                                        ((df['High'] / df['Low']).apply(np.log))**2)
+            
+            # Garman-Klass volatility
+            df['garman_klass_vol'] = np.sqrt(0.5 * np.log(df['High'] / df['Low'])**2 - 
+                                            (2 * np.log(2) - 1) * np.log(df['Close'] / df['Open'])**2)
+            
+            # Rolling volatility measures
+            windows = [5, 10, 20] if self.timeframe in ["30m", "1h"] else [3, 5, 10]
+            
+            for window in windows:
+                # Standard deviation of returns
+                df[f'return_vol_{window}'] = df['Close'].pct_change().rolling(window).std()
+                
+                # Range-based volatility
+                df[f'range_vol_{window}'] = ((df['High'] - df['Low']) / df['Close']).rolling(window).mean()
+                
+                # Realized volatility
+                df[f'realized_vol_{window}'] = np.sqrt(
+                    (df['Close'].pct_change()**2).rolling(window).sum() / window
+                )
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error adding volatility features: {str(e)}")
+            return data
+            
+    def add_momentum_features(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Add momentum and trend features"""
+        try:
+            df = data.copy()
+            
+            # Define lookback periods based on timeframe
+            if self.timeframe in ["30m", "1h"]:
+                periods = [12, 24, 48, 96]  # 6h, 12h, 24h, 48h for hourly data
+            else:
+                periods = [3, 5, 10, 20]
+            
+            for period in periods:
+                # ROC (Rate of Change)
+                df[f'roc_{period}'] = df['Close'].pct_change(period)
+                
+                # Momentum
+                df[f'momentum_{period}'] = df['Close'] - df['Close'].shift(period)
+                
+                # Acceleration
+                df[f'acceleration_{period}'] = df[f'momentum_{period}'] - df[f'momentum_{period}'].shift(1)
+                
+                # Trend strength
+                df[f'trend_strength_{period}'] = df['Close'].rolling(period).mean() / df['Close'] - 1
+            
+            # Add RSI variations
+            df['rsi_smooth'] = df['RSI'].rolling(3).mean()
+            df['rsi_impulse'] = df['RSI'] - df['RSI'].shift(3)
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error adding momentum features: {str(e)}")
+            return data
+            
+    def add_volume_features(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Add advanced volume analysis features"""
+        try:
+            df = data.copy()
+            
+            # Volume momentum
+            df['volume_momentum'] = df['Volume'].pct_change()
+            
+            # Volume weighted average price variations
+            windows = [5, 10, 20] if self.timeframe in ["30m", "1h"] else [3, 5, 10]
+            
+            for window in windows:
+                # VWAP
+                df[f'vwap_{window}'] = (df['Volume'] * (df['High'] + df['Low'] + df['Close']) / 3).rolling(window).sum() / df['Volume'].rolling(window).sum()
+                
+                # Volume force
+                df[f'volume_force_{window}'] = df['volume_momentum'] * df['Close'].pct_change()
+                
+                # Price-volume trend
+                df[f'pvt_{window}'] = (df['Close'].pct_change() * df['Volume']).rolling(window).sum()
+            
+            # Volume profile
+            df['volume_price_spread'] = (df['High'] - df['Low']) * df['Volume']
+            df['volume_price_correlation'] = df['Close'].rolling(20).corr(df['Volume'])
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error adding volume features: {str(e)}")
+            return data
+            
+    def generate_synthetic_samples(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Generate synthetic samples for rare events"""
+        try:
+            df = data.copy()
+            
+            # Identify rare events (e.g., large price movements)
+            returns = df['Close'].pct_change()
+            std_dev = returns.std()
+            rare_events = abs(returns) > 2 * std_dev  # More than 2 standard deviations
+            
+            if rare_events.sum() < len(df) * 0.1:  # Less than 10% rare events
+                logger.info("Generating synthetic samples for rare events")
+                
+                rare_samples = df[rare_events].copy()
+                
+                # Create variations of rare events
+                for _ in range(3):  # Generate 3 variations for each rare event
+                    variation = rare_samples.copy()
+                    
+                    # Add small random variations to features
+                    for col in variation.select_dtypes(include=[np.number]).columns:
+                        noise = np.random.normal(0, 0.01, len(variation))
+                        variation[col] = variation[col] * (1 + noise)
+                    
+                    df = pd.concat([df, variation])
+            
+            return df.sort_index()
+            
+        except Exception as e:
+            logger.error(f"Error generating synthetic samples: {str(e)}")
+            return data
+            
+    def process(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Apply all feature engineering and augmentation steps"""
+        try:
+            df = data.copy()
+            
+            # 1. Add price patterns
+            df = self.add_price_patterns(df)
+            
+            # 2. Add volatility features
+            df = self.add_volatility_features(df)
+            
+            # 3. Add momentum features
+            df = self.add_momentum_features(df)
+            
+            # 4. Add volume features
+            df = self.add_volume_features(df)
+            
+            # 5. Generate synthetic samples if needed
+            if len(df) > 100:  # Only for sufficient data
+                df = self.generate_synthetic_samples(df)
+            
+            # Remove any features with too many missing values
+            missing_pct = df.isnull().sum() / len(df)
+            cols_to_drop = missing_pct[missing_pct > 0.1].index
+            if not cols_to_drop.empty:
+                logger.warning(f"Dropping columns with too many missing values: {cols_to_drop.tolist()}")
+                df = df.drop(columns=cols_to_drop)
+            
+            # Fill remaining missing values
+            df = df.fillna(method='ffill').fillna(method='bfill')
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error in augmentation pipeline: {str(e)}")
+            raise
+
+def main(symbol: str, timeframe: str):
+    """Command-line entry point for prediction"""
+    try:
+        logger.debug(f"Script started: Predicting for {symbol} with timeframe {timeframe}")
+        print(f"Starting prediction for {symbol} with timeframe {timeframe}")
+        if timeframe not in settings.TIMEFRAME_OPTIONS:
+            error_msg = f"Invalid timeframe. Must be one of: {', '.join(settings.TIMEFRAME_OPTIONS)}"
+            logger.error(error_msg)
+            print(error_msg)
+            sys.exit(1)
+        if timeframe == "24h":
+            result = ensemble_prediction(symbol)
+        else:
+            result = predict_next_price(symbol, timeframe)
+        if "error" in result:
+            logger.error(f"Prediction error: {result['error']}")
+            print(f"Error: {result['error']}")
+            sys.exit(1)
+        logger.debug(f"Prediction result: {result}")
+        print(f"Prediction result: {result}")
+        return result
+    except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}", exc_info=True)
+        print(f"Unexpected error: {str(e)}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    if len(sys.argv) != 3:
+        print("Usage: python -m controllers.predictor <symbol> <timeframe>")
+        sys.exit(1)
+    main(sys.argv[1], sys.argv[2])
+
+    

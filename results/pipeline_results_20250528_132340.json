@@ -1,0 +1,23 @@
+{
+  "start_time": "2025-05-28T13:23:40.254819+00:00",
+  "symbols": [
+    "BTC"
+  ],
+  "timeframes": [
+    "1h"
+  ],
+  "training": null,
+  "evaluation": null,
+  "predictions": {
+    "BTC": {
+      "1h": {
+        "error": "type object 'ErrorCategory' has no attribute 'MODEL_PREDICTION'"
+      },
+      "ensemble": {
+        "error": "type object 'ErrorCategory' has no attribute 'MODEL_PREDICTION'"
+      }
+    }
+  },
+  "end_time": "2025-05-28T13:23:47.503743+00:00",
+  "duration": "0:00:07.248924"
+}

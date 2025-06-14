@@ -1,0 +1,67 @@
+{
+  "start_time": "2025-05-28T15:30:56.192412+00:00",
+  "symbols": [
+    "BTC",
+    "ETH"
+  ],
+  "timeframes": [
+    "1h",
+    "4h"
+  ],
+  "data_validation": {
+    "BTC": {
+      "1h": {
+        "status": "error",
+        "error": "Data validation failed for BTC (1h)"
+      },
+      "4h": {
+        "status": "error",
+        "error": "No data available for BTC (4h)"
+      }
+    },
+    "ETH": {
+      "1h": {
+        "status": "error",
+        "error": "Data validation failed for ETH (1h)"
+      },
+      "4h": {
+        "status": "error",
+        "error": "No data available for ETH (4h)"
+      }
+    }
+  },
+  "training": null,
+  "evaluation": {
+    "total": 4,
+    "successful": 0,
+    "results": [
+      {
+        "symbol": "BTC",
+        "timeframe": "1h",
+        "status": "error",
+        "error": "Passing a dict as an indexer is not supported. Use a list instead."
+      },
+      {
+        "symbol": "BTC",
+        "timeframe": "4h",
+        "status": "error",
+        "error": "\"'model_config' not found in checkpoint for /home/intikhab/CryptoAion-AI-main/Crypto-main/models/BTC/model_4h.pth. Model may be outdated or saved incorrectly.\""
+      },
+      {
+        "symbol": "ETH",
+        "timeframe": "1h",
+        "status": "error",
+        "error": "\"'model_config' not found in checkpoint for /home/intikhab/CryptoAion-AI-main/Crypto-main/models/ETH/model_1h.pth. Model may be outdated or saved incorrectly.\""
+      },
+      {
+        "symbol": "ETH",
+        "timeframe": "4h",
+        "status": "error",
+        "error": "\"'model_config' not found in checkpoint for /home/intikhab/CryptoAion-AI-main/Crypto-main/models/ETH/model_4h.pth. Model may be outdated or saved incorrectly.\""
+      }
+    ]
+  },
+  "predictions": {},
+  "end_time": "2025-05-28T15:32:13.217010+00:00",
+  "duration": "0:01:17.024598"
+}

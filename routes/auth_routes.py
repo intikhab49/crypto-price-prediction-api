@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException, status, Body, Header
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
 from models.user import User, pwd_context
 import jwt
 from config import settings
@@ -9,6 +9,14 @@ from typing import Optional
 router = APIRouter()
 
 class UserCreate(BaseModel):
+    username: str
+    password: str
+    email: EmailStr
+    
+    class Config:
+        from_attributes = True
+
+class UserLogin(BaseModel):
     username: str
     password: str
     
@@ -60,7 +68,7 @@ async def register(user: UserCreate):
         )
 
 @router.post('/login', response_model=Token)
-async def login(user: UserCreate):
+async def login(user: UserLogin):
     try:
         # Find user
         db_user = await User.filter(username=user.username).first()

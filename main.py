@@ -1,84 +1,79 @@
 import os
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from routes.auth_routes import router as auth_router
+from fastapi.responses import JSONResponse
 from routes.prediction import router as prediction_router
 from routes.coingecko import router as coingecko_router
 from routes.yfinance import router as yfinance_router
-from config import settings
-from tortoise.contrib.fastapi import register_tortoise
-from mangum import Mangum
+import logging
+
+# Ensure logs directory exists
+os.makedirs('logs', exist_ok=True)
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('logs/app.log')
+    ]
+)
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title=settings.PROJECT_NAME,
-    openapi_url=f"{settings.API_V1_PREFIX}/openapi.json",
-    docs_url=f"{settings.API_V1_PREFIX}/docs",
-    redoc_url=f"{settings.API_V1_PREFIX}/redoc",
+    title="Crypto Price Prediction API",
+    description="API for cryptocurrency price prediction using machine learning",
+    version="1.0.0"
 )
-handler = Mangum(app)
 
-# Configure CORS
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Replace with specific origins in production
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["*"],
-    max_age=600
 )
 
-# Register routes
-app.include_router(
-    coingecko_router,
-    prefix="/api/coingecko",
-    tags=["CoinGecko"],
-    responses={404: {"description": "Not found"}}
-)
-app.include_router(
-    auth_router,
-    prefix="/auth",
-    tags=["Authentication"],
-    responses={404: {"description": "Not found"}}
-)
-app.include_router(
-    prediction_router,
-    prefix=f"{settings.API_V1_PREFIX}/predictions",
-    tags=["Predictions"],
-    responses={404: {"description": "Not found"}}
-)
-app.include_router(
-    yfinance_router,
-    prefix=f"{settings.API_V1_PREFIX}/yfinance",
-    tags=["YFinance"],
-    responses={404: {"description": "Not found"}}
-)
-
-# Database setup
-DATABASE_URL = os.getenv("DATABASE_URL", settings.DATABASE_URL)
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-register_tortoise(
-    app,
-    db_url=DATABASE_URL,
-    modules={"models": ["models.user"]},
-    generate_schemas=True,
-    add_exception_handlers=True,
-)
+# Include all routers
+app.include_router(prediction_router, prefix="/api")
+app.include_router(coingecko_router, prefix="/api/coingecko", tags=["CoinGecko Data"])
+app.include_router(yfinance_router, prefix="/api/yfinance", tags=["Yahoo Finance Data"])
 
 @app.get("/")
-def read_root():
+async def root():
+    """Root endpoint"""
     return {
-        "status": "success",
-        "message": "CryptoAion AI is running!",
+        "status": "online",
         "version": "1.0.0",
-        "docs": f"{settings.API_V1_PREFIX}/docs"
+        "endpoints": [
+            "/api/predict/{symbol}"
+        ]
     }
 
 @app.get("/api/health")
-async def health():
-    return {"status": "ok", "message": "CryptoAion AI is running"}
+async def health_check():
+    """Health check endpoint"""
+    return {"status": "ok", "version": "2.0.0"}
 
-@app.options("/{path:path}")
-async def options_handler(request: Request, path: str):
-    return {"detail": "OK"}
+# Error handlers
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request, exc):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": str(exc.detail)}
+    )
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request, exc):
+    logger.error(f"Unhandled exception: {str(exc)}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={"error": "Internal server error", "detail": str(exc)}
+    )
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -1,0 +1,637 @@
+
+import os
+import sys
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import joblib
+from sklearn.preprocessing import RobustScaler
+from config import settings
+from fastapi import HTTPException
+import time
+import logging
+import requests
+from datetime import datetime, timedelta
+import pytz
+from scipy.stats import ks_2samp
+from joblib import Memory
+import psutil
+from cachetools import TTLCache
+import torch.serialization
+from datetime import datetime
+
+# Allowlist datetime.datetime for safe model loading
+torch.serialization.add_safe_globals([datetime])
+
+# Setup logging
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Constants
+MODEL_PATH = "models"
+MAX_RETRIES = 3
+RETRY_DELAY = 2
+EPOCHS = 100
+PATIENCE = 20
+CACHE_DIR = "cache"
+MEMORY = Memory(CACHE_DIR, verbose=0)
+BATCH_SIZE = 16
+MIN_MEMORY_GB = 0.5
+
+# Timeframe mapping
+TIMEFRAME_MAP = {
+    "30m": {"period": "7d", "interval": "30m", "lookback": 30, "sma_window": 5, "ema_span": 6, "bb_window": 10, "momentum_window": 5},
+    "1h": {"period": "60d", "interval": "1h", "lookback": 60, "sma_window": 5, "ema_span": 6, "bb_window": 10, "momentum_window": 5},
+    "4h": {"period": "60d", "interval": "1h", "lookback": 90, "sma_window": 5, "ema_span": 6, "bb_window": 10, "momentum_window": 5},
+    "24h": {"period": "1095d", "interval": "1d", "lookback": 720, "sma_window": 20, "ema_span": 12, "bb_window": 20, "momentum_window": 14}
+}
+
+# Cache for sentiment and price data
+SENTIMENT_CACHE = TTLCache(maxsize=100, ttl=300)
+PRICE_CACHE = TTLCache(maxsize=10, ttl=60)
+
+# CoinGecko ID mapping
+COINGECKO_ID_MAP = {
+    "BTC": "bitcoin",
+    "ETH": "ethereum",
+    "XRP": "ripple"
+}
+
+# Feature list for model compatibility
+FEATURE_LIST = ['Close', 'SMA', 'EMA', 'RSI', 'MACD', 'Bollinger_Upper', 'Bollinger_Lower', 'ATR', 'OBV', 'VWAP', 'Momentum', 'Volatility', 'Lag1', 'Sentiment_Up']
+
+@MEMORY.cache
+def fetch_yfinance_data(symbol, period, interval):
+    """Cached yfinance data fetch with consistent timezone handling"""
+    try:
+        end = datetime.now().replace(tzinfo=None)
+        data = yf.download(tickers=symbol, period=period, interval=interval, 
+                          timeout=30, auto_adjust=False, prepost=False, end=end)
+        if not data.empty:
+            if data.index.tz is None:
+                data.index = data.index.tz_localize('UTC')
+            else:
+                data.index = data.index.tz_convert('UTC')
+            latest_timestamp = data.index[-1].to_pydatetime()
+            now = datetime.now(pytz.UTC)
+            staleness_limit = 86400 if interval == '1d' else 3600
+            if (now - latest_timestamp).total_seconds() > staleness_limit:
+                logger.warning(f"yfinance data is stale: {latest_timestamp}")
+                return pd.DataFrame()
+            logger.debug(f"yfinance fetched {len(data)} rows for {symbol}")
+        else:
+            logger.warning(f"yfinance returned empty data for {symbol}")
+        return data
+    except Exception as e:
+        logger.error(f"yfinance fetch failed for {symbol} ({period}, {interval}): {str(e)}", exc_info=True)
+        return pd.DataFrame()
+
+def check_server(timeout: int = 2) -> bool:
+    """Check if FastAPI server is running"""
+    try:
+        response = requests.get("http://localhost:8000/api/health", timeout=timeout)
+        return response.status_code == 200
+    except requests.exceptions.RequestException:
+        logger.error("FastAPI server is not running")
+        return False
+
+def fetch_coingecko_sentiment(symbol: str):
+    """Fetch sentiment from CoinGecko with retries and caching"""
+    cache_key = f"sentiment_{symbol}"
+    if cache_key in SENTIMENT_CACHE:
+        logger.debug(f"Returning cached sentiment for {symbol}")
+        return SENTIMENT_CACHE[cache_key]
+
+    if not check_server():
+        logger.warning("FastAPI server not available, using default sentiment 0.5")
+        return SENTIMENT_CACHE.get(cache_key, 0.5)
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            url = f"http://localhost:8000/api/coingecko/by-symbol/{symbol}"
+            resp = requests.get(url, timeout=15)
+            if resp.status_code == 200:
+                data = resp.json()
+                up = data.get('sentiment_votes_up_percentage', 50) / 100
+                logger.debug(f"Fetched sentiment for {symbol}: {up}")
+                SENTIMENT_CACHE[cache_key] = up
+                return up
+            logger.error(f"Sentiment fetch attempt {attempt + 1} failed: {resp.status_code}")
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY)
+        except Exception as e:
+            logger.error(f"Sentiment fetch error on attempt {attempt + 1}: {str(e)}")
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY)
+    logger.warning(f"Failed to fetch sentiment for {symbol} after {MAX_RETRIES} attempts, using default 0.5")
+    return SENTIMENT_CACHE.get(cache_key, 0.5)
+
+def fetch_coingecko_price(symbol: str):
+    """Fetch real-time price from CoinGecko"""
+    cache_key = f"price_{symbol}"
+    if cache_key in PRICE_CACHE:
+        logger.debug(f"Returning cached price for {symbol}")
+        return PRICE_CACHE[cache_key]
+
+    if not check_server():
+        logger.warning("FastAPI server not available, cannot fetch price")
+        return None
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            url = f"http://localhost:8000/api/coingecko/by-symbol/{symbol}"
+            resp = requests.get(url, timeout=15)
+            if resp.status_code == 200:
+                data = resp.json()
+                price = data.get('market_data', {}).get('current_price', {}).get('usd')
+                if price:
+                    PRICE_CACHE[cache_key] = price
+                    logger.debug(f"Fetched price for {symbol}: {price}")
+                    return price
+                logger.error(f"No price data in response for {symbol}")
+            logger.error(f"Price fetch attempt {attempt + 1} failed: {resp.status_code}")
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY)
+        except Exception as e:
+            logger.error(f"Price fetch error on attempt {attempt + 1}: {str(e)}")
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY)
+    logger.warning(f"Failed to fetch price for {symbol} after {MAX_RETRIES} attempts")
+    return None
+
+def fetch_coingecko_fallback(coin_id, timeframe):
+    """Fallback to CoinGecko historical data"""
+    try:
+        days = {"30m": 7, "1h": 30, "4h": 30, "24h": 365}[timeframe]
+        coin_id = COINGECKO_ID_MAP.get(coin_id, coin_id.lower())
+        url = f"http://localhost:8000/api/coingecko/historical/{coin_id}?days={days}"
+        for attempt in range(MAX_RETRIES):
+            try:
+                resp = requests.get(url, timeout=15)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    prices = data.get("prices", [])
+                    volumes = data.get("total_volumes", [])
+                    dates = data.get("dates", [])
+                    if not prices or not dates:
+                        logger.error(f"No prices or dates in response for {coin_id}")
+                        return pd.DataFrame()
+                    df = pd.DataFrame({
+                        'Open': prices[:-1] + [prices[-1]],
+                        'High': prices,
+                        'Low': prices,
+                        'Close': prices,
+                        'Volume': volumes
+                    }, index=[pd.Timestamp(ms, unit='ms', tz='UTC') for ms in dates])
+                    logger.debug(f"CoinGecko fallback fetched {len(df)} rows for {coin_id}")
+                    return df
+                logger.error(f"CoinGecko fallback attempt {attempt + 1} failed: {resp.status_code}")
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(RETRY_DELAY)
+            except Exception as e:
+                logger.error(f"CoinGecko fallback error on attempt {attempt + 1}: {str(e)}")
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(RETRY_DELAY)
+        return pd.DataFrame()
+    except Exception as e:
+        logger.error(f"CoinGecko fallback failed: {str(e)}")
+        return pd.DataFrame()
+
+def get_latest_data(symbol, timeframe="1h"):
+    """Get latest data with timeframe support and CoinGecko fallback"""
+    if timeframe not in TIMEFRAME_MAP:
+        raise ValueError(f"Invalid timeframe. Must be one of {list(TIMEFRAME_MAP.keys())}")
+    
+    if not symbol.endswith('-USD'):
+        symbol = f"{symbol}-USD"
+    
+    tf_config = TIMEFRAME_MAP[timeframe]
+    data = pd.DataFrame()
+    
+    for attempt in range(MAX_RETRIES):
+        try:
+            logger.debug(f"Fetching yfinance data for {symbol}, attempt {attempt + 1}")
+            data = fetch_yfinance_data(symbol, tf_config["period"], tf_config["interval"])
+            if not data.empty:
+                break
+            if attempt < MAX_RETRIES - 1:
+                logger.warning(f"yfinance attempt {attempt + 1} failed, retrying in {RETRY_DELAY}s")
+                time.sleep(RETRY_DELAY)
+        except Exception as e:
+            logger.error(f"yfinance error on attempt {attempt + 1}: {str(e)}")
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY)
+    
+    if data.empty:
+        logger.warning(f"yfinance failed after {MAX_RETRIES} attempts, using CoinGecko")
+        coin_id = symbol.replace('-USD', '')
+        data = fetch_coingecko_fallback(coin_id, timeframe)
+    
+    if data.empty:
+        raise ValueError(f"No data retrieved for {symbol}. Please try again later.")
+    
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = [col[0] for col in data.columns]
+    
+    data.columns = [str(col).replace(' ', '_') for col in data.columns]
+    
+    if 'Adj_Close' in data.columns:
+        data = data.drop(columns=['Adj_Close'])
+    
+    if timeframe == "4h" and tf_config["interval"] == "1h":
+        data = data.resample('4h').agg({
+            'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
+        }).dropna()
+    
+    if timeframe == "24h":
+        data['Volume'] = data['Volume'] / data['Volume'].mean()
+    
+    sma_window = tf_config["sma_window"]
+    ema_span = tf_config["ema_span"]
+    bb_window = tf_config["bb_window"]
+    momentum_window = tf_config["momentum_window"]
+    
+    data['SMA'] = data['Close'].rolling(window=sma_window).mean()
+    data['EMA'] = data['Close'].ewm(span=ema_span, adjust=False).mean()
+    delta = data['Close'].diff()
+    gain = delta.where(delta > 0, 0).rolling(window=max(7, sma_window)).mean()
+    loss = -delta.where(delta < 0, 0).rolling(window=max(7, sma_window)).mean()
+    rs = gain / loss
+    data['RSI'] = 100 - (100 / (1 + rs))
+    data['MACD'] = data['Close'].ewm(span=ema_span, adjust=False).mean() - data['Close'].ewm(span=ema_span*2, adjust=False).mean()
+    data['Bollinger_Upper'] = data['Close'].rolling(window=bb_window).mean() + 2 * data['Close'].rolling(window=bb_window).std()
+    data['Bollinger_Lower'] = data['Close'].rolling(window=bb_window).mean() - 2 * data['Close'].rolling(window=bb_window).std()
+    data['ATR'] = ((data['High'] - data['Low']).rolling(max(7, sma_window)).mean() + 
+                   (data['High'] - data['Close'].shift()).abs().rolling(max(7, sma_window)).mean() + 
+                   (data['Low'] - data['Close'].shift()).abs().rolling(max(7, sma_window)).mean()) / 3
+    data['OBV'] = (np.sign(data['Close'].diff()) * data['Volume']).cumsum()
+    data['VWAP'] = (data['Volume'] * (data['High'] + data['Low'] + data['Close']) / 3).cumsum() / data['Volume'].cumsum()
+    data['Momentum'] = data['Close'].diff(momentum_window)
+    data['Volatility'] = 0.5 * (data['Close'].rolling(window=max(7, sma_window)).std() / data['Close'].rolling(window=max(7, sma_window)).mean())
+    data['Lag1'] = data['Close'].shift(1)
+    
+    sentiment = fetch_coingecko_sentiment(symbol.replace('-USD', ''))
+    data['Sentiment_Up'] = sentiment if sentiment is not None else 0.5
+    
+    logger.debug(f"Data before fillna: {data.shape}, NaN counts: {data.isna().sum().to_dict()}")
+    data.ffill(inplace=True)
+    data.fillna(data.mean(), inplace=True)
+    
+    required_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+    missing_columns = [col for col in required_columns if col not in data.columns]
+    if missing_columns:
+        raise ValueError(f"Missing required columns: {missing_columns}")
+    
+    logger.debug(f"Data shape: {data.shape}, Features: {list(data.columns)}")
+    return data
+
+def ensemble_prediction(symbol, timeframes=["1h", "4h", "24h"]):
+    """Combine predictions from multiple timeframes"""
+    predictions = {}
+    weights = {"1h": 0.4, "4h": 0.3, "24h": 0.3}  # Adjust based on timeframe reliability
+    for tf in timeframes:
+        result = predict_next_price(symbol, tf)
+        if "error" not in result:
+            predictions[tf] = result["predicted_price"]
+    
+    if not predictions:
+        logger.error("No valid predictions for ensemble")
+        return predict_next_price(symbol, "24h")
+    
+    weighted_avg = sum(predictions[tf] * weights.get(tf, 0) for tf in predictions) / sum(weights.get(tf, 0) for tf in predictions)
+    last_result = predict_next_price(symbol, "24h")
+    last_result["predicted_price"] = weighted_avg
+    last_result["ensemble"] = predictions
+    return last_result
+
+def predict_next_price(symbol, timeframe="24h"):
+    """Predict next price with timeframe support"""
+    try:
+        if not check_server():
+            error_msg = "FastAPI server is not running. Start it with 'uvicorn main:app --host 0.0.0.0 --port 8000'"
+            logger.error(error_msg)
+            raise Exception(error_msg)
+
+        if timeframe not in TIMEFRAME_MAP:
+            timeframe = settings.DEFAULT_TIMEFRAME
+            logger.warning(f"Invalid timeframe, defaulting to {timeframe}")
+        
+        if timeframe == "24h":
+            SENTIMENT_CACHE.clear()
+            PRICE_CACHE.clear()
+        
+        lookback = TIMEFRAME_MAP[timeframe]["lookback"]
+        model, X_train, scaler, scaled_data = get_model(symbol, timeframe, lookback)
+        
+        latest_data = get_latest_data(symbol, timeframe)
+        features = latest_data[['Close', 'SMA', 'EMA', 'RSI', 'MACD', 'Bollinger_Upper', 
+                              'Bollinger_Lower', 'ATR', 'OBV', 'VWAP', 'Momentum', 'Volatility', 'Lag1', 'Sentiment_Up']].values
+        scaled_features = scaler.transform(features)
+        
+        X_input = scaled_features[-lookback:].reshape(1, lookback, 14)
+        
+        mem = psutil.virtual_memory()
+        if mem.available < MIN_MEMORY_GB * (1024**3):
+            logger.warning(f"Low memory for inference: {mem.available / (1024**3):.2f} GB. May cause issues.")
+        
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model.to(device)
+        with torch.no_grad():
+            model.eval()
+            input_tensor = torch.FloatTensor(X_input).to(device)
+            prediction_scaled = model(input_tensor).cpu().numpy()
+        
+        if prediction_scaled.ndim == 0:
+            prediction_scaled = prediction_scaled.reshape(1,)
+        elif prediction_scaled.ndim > 1:
+            prediction_scaled = prediction_scaled.flatten()[:1]
+        
+        logger.debug(f"Prediction scaled shape: {prediction_scaled.shape}")
+        prediction = scaler.inverse_transform(
+            np.concatenate([prediction_scaled.reshape(1, 1), np.zeros((1, 13))], axis=1)
+        )[0, 0]
+        
+        yfinance_price = latest_data['Close'].iloc[-1]
+        coingecko_price = fetch_coingecko_price(symbol.replace('-USD', ''))
+        if coingecko_price and yfinance_price:
+            last_actual_price = yfinance_price if abs(yfinance_price - coingecko_price) / coingecko_price < 0.02 else coingecko_price
+            price_source = "yfinance" if last_actual_price == yfinance_price else "CoinGecko"
+        else:
+            last_actual_price = yfinance_price or coingecko_price
+            price_source = "yfinance" if yfinance_price else "CoinGecko"
+        logger.debug(f"yfinance price: {yfinance_price}, CoinGecko price: {coingecko_price}, using {price_source}")
+        logger.debug(f"Latest RSI: {latest_data['RSI'].iloc[-1]}")
+        
+        last_timestamp = latest_data.index[-1]
+        next_timestamp = get_next_timestamp(last_timestamp, timeframe)
+        
+        result = {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "predicted_price": float(prediction),
+            "last_actual_price": float(last_actual_price),
+            "prediction_time": next_timestamp.isoformat(),
+            "current_time": datetime.now(pytz.UTC).isoformat(),
+            "rsi": float(latest_data['RSI'].iloc[-1]),
+            "price_source": price_source
+        }
+        logger.debug(f"Prediction result: {result}")
+        print(f"Prediction result: {result}")
+        return result
+    
+    except Exception as e:
+        error_msg = f"Prediction failed: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        return {"error": error_msg}
+
+def get_next_timestamp(last_timestamp, timeframe):
+    """Calculate next timestamp based on timeframe with timezone handling"""
+    timeframe_deltas = {
+        "30m": pd.Timedelta(minutes=30),
+        "1h": pd.Timedelta(hours=1),
+        "4h": pd.Timedelta(hours=4),
+        "24h": pd.Timedelta(days=1)
+    }
+    now = datetime.now(pytz.UTC)
+    if last_timestamp.tzinfo is None:
+        last_timestamp = last_timestamp.tz_localize('UTC')
+    if timeframe == "24h":
+        next_ts = (last_timestamp + pd.Timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    else:
+        next_ts = last_timestamp + timeframe_deltas[timeframe]
+    if next_ts <= now:
+        periods = int((now - last_timestamp) / timeframe_deltas[timeframe]) + 1
+        if timeframe == "24h":
+            next_ts = (last_timestamp + periods * timeframe_deltas[timeframe]).replace(hour=0, minute=0, second=0, microsecond=0)
+        else:
+            next_ts = last_timestamp + periods * timeframe_deltas[timeframe]
+    return next_ts
+
+class BiLSTMWithAttention(nn.Module):
+    def __init__(self, input_size=14, hidden_size=32, num_layers=2, dropout=0.3):
+        super(BiLSTMWithAttention, self).__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, 
+                           bidirectional=True, dropout=dropout)
+        self.attn = nn.Linear(hidden_size * 2, 1)
+        self.fc = nn.Linear(hidden_size * 2, 1)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        lstm_out, _ = self.lstm(x)
+        attn_weights = torch.softmax(self.attn(lstm_out), dim=1)
+        attn_applied = torch.bmm(attn_weights.transpose(1, 2), lstm_out).squeeze(1)
+        output = self.dropout(attn_applied)
+        output = self.fc(output)
+        return output.squeeze(-1)
+
+def add_technical_indicators(symbol, timeframe="24h", lookback=60):
+    """Add technical indicators and prepare data"""
+    data = get_latest_data(symbol, timeframe)
+    
+    scaler = RobustScaler()
+    scaled_data = scaler.fit_transform(data[['Close', 'SMA', 'EMA', 'RSI', 'MACD', 
+                                           'Bollinger_Upper', 'Bollinger_Lower', 'ATR', 
+                                           'OBV', 'VWAP', 'Momentum', 'Volatility', 'Lag1', 'Sentiment_Up']].values)
+    
+    X, y = [], []
+    for i in range(len(scaled_data) - lookback - 1):
+        X.append(scaled_data[i:i+lookback])
+        y.append(scaled_data[i+lookback, 0])
+    X, y = np.array(X), np.array(y)
+    
+    if len(X) < 10:
+        raise ValueError(f"Insufficient data for training: {len(X)} samples available")
+    
+    split = int(0.8 * len(X))
+    X_train, X_val = torch.FloatTensor(X[:split]), torch.FloatTensor(X[split:])
+    y_train, y_val = torch.FloatTensor(y[:split]), torch.FloatTensor(y[split:])
+    
+    model = BiLSTMWithAttention(input_size=14, hidden_size=32 if timeframe == "24h" else 64, num_layers=2, dropout=0.3)
+    return X_train, y_train, X_val, y_val, model, scaler, scaled_data
+
+def check_data_drift(old_data, new_data):
+    """Detect data drift using KS test"""
+    if len(old_data) < 10 or len(new_data) < 10:
+        return True
+    stat, p = ks_2samp(old_data[:, 0], new_data[:, 0])
+    return p < 0.01
+
+def get_model(symbol, timeframe="24h", lookback=60):
+    """Get or train model with timeframe support"""
+    os.makedirs(MODEL_PATH, exist_ok=True)
+    model_path = os.path.join(MODEL_PATH, f"{symbol}_{timeframe}_model.pth")
+    scaler_path = os.path.join(MODEL_PATH, f"{symbol}_{timeframe}_scaler.pkl")
+    data_path = os.path.join(MODEL_PATH, f"{symbol}_{timeframe}_data.pkl")
+    
+    X_train, y_train, X_val, y_val, model, scaler, scaled_data = add_technical_indicators(symbol, timeframe, lookback)
+    
+    mem = psutil.virtual_memory()
+    logger.info(f"Available memory: {mem.available / (1024**3):.2f} GB")
+    if mem.available < MIN_MEMORY_GB * (1024**3):
+        logger.warning(f"Memory too low for training: {mem.available / (1024**3):.2f} GB. Using last model if available.")
+        if os.path.exists(model_path):
+            checkpoint = torch.load(model_path, map_location=torch.device('cpu'))
+            model.load_state_dict(checkpoint['model_state_dict'])
+            scaler = joblib.load(scaler_path)
+            return model, X_train, scaler, scaled_data
+        raise RuntimeError("Memory too low and no pre-trained model available.")
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    X_train, y_train = X_train.to(device), y_train.to(device)
+    X_val, y_val = X_val.to(device), y_val.to(device)
+    
+    criterion = nn.HuberLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=0.0001, weight_decay=1e-6)
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2)
+    
+    retrain = False
+    if os.path.exists(model_path) and os.path.exists(scaler_path) and os.path.exists(data_path):
+        logger.info(f"Loading pre-trained model for {symbol} {timeframe}")
+        try:
+            checkpoint = torch.load(model_path, map_location=torch.device('cpu'))
+            if checkpoint.get('feature_list', []) != FEATURE_LIST:
+                logger.warning("Feature list mismatch, forcing retrain")
+                retrain = True
+            else:
+                state_dict = checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint
+                model.load_state_dict(state_dict)
+                scaler = joblib.load(scaler_path)
+                old_data = joblib.load(data_path)
+                mtime = os.path.getmtime(model_path)
+                model_time = datetime.fromtimestamp(mtime, tz=pytz.UTC)
+                now = datetime.now(pytz.UTC)
+                if check_data_drift(old_data, scaled_data) or (now - model_time).days > 7:
+                    logger.info("Data drift detected or model outdated, retraining")
+                    retrain = True
+                else:
+                    return model, X_train, scaler, scaled_data
+        except Exception as e:
+            logger.warning(f"Failed to load model: {str(e)}. Deleting old model and retraining.")
+            for path in [model_path, scaler_path, data_path]:
+                if os.path.exists(path):
+                    os.remove(path)
+            retrain = True
+    
+    if retrain or not os.path.exists(model_path):
+        logger.info(f"Training model for {symbol} {timeframe}")
+        try:
+            best_val_mape = float('inf')
+            patience_counter = 0
+            
+            num_batches = max(1, len(X_train) // BATCH_SIZE)
+            logger.debug(f"Training with {num_batches} batches of size {BATCH_SIZE}")
+            
+            for epoch in range(EPOCHS):
+                model.train()
+                for i in range(0, len(X_train), BATCH_SIZE):
+                    batch_X = X_train[i:i+BATCH_SIZE]
+                    batch_y = y_train[i:i+BATCH_SIZE]
+                    optimizer.zero_grad()
+                    output = model(batch_X)
+                    loss = criterion(output, batch_y)
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+                    optimizer.step()
+                
+                model.eval()
+                with torch.no_grad():
+                    val_output = model(X_val)
+                    val_loss = criterion(val_output, y_val)
+                    val_mape = torch.mean(torch.abs((val_output - y_val) / (y_val + 1e-8))).item() * 100
+                
+                scheduler.step()
+                
+                if val_mape < best_val_mape:
+                    best_val_mape = val_mape
+                    patience_counter = 0
+                    torch.save({
+                        'model_state_dict': model.state_dict(),
+                        'input_size': 14,
+                        'hidden_size': 32 if timeframe == "24h" else 64,
+                        'num_layers': 2,
+                        'feature_list': FEATURE_LIST
+                    }, model_path)
+                    joblib.dump(scaler, scaler_path)
+                    joblib.dump(scaled_data, data_path)
+                else:
+                    patience_counter += 1
+                
+                if epoch % 10 == 0:
+                    mae = torch.mean(torch.abs(val_output - y_val)).item()
+                    rmse = torch.sqrt(torch.mean((val_output - y_val) ** 2)).item()
+                    logger.debug(f"Epoch {epoch}, Train Loss: {loss.item():.4f}, Val Loss: {val_loss.item():.4f}, MAPE: {val_mape:.2f}%, MAE: {mae:.4f}, RMSE: {rmse:.4f}")
+                
+                if patience_counter >= PATIENCE:
+                    logger.info(f"Early stopping at epoch {epoch}")
+                    break
+            
+            model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu'))['model_state_dict'])
+        except Exception as e:
+            logger.error(f"Training failed: {str(e)}", exc_info=True)
+            raise RuntimeError(f"Model training failed: {str(e)}")
+    
+    return model, X_train, scaler, scaled_data
+
+def prepare_data_for_prediction(symbol, timeframe="24h"):
+    """Prepare prediction data with timeframe support"""
+    try:
+        lookback = TIMEFRAME_MAP[timeframe]["lookback"]
+        latest_data = get_latest_data(symbol, timeframe)
+        model, X_train, scaler, scaled_data = get_model(symbol, timeframe, lookback)
+        model.eval()
+        
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model.to(device)
+        
+        with torch.no_grad():
+            predictions = model(X_train.to(device)).cpu().numpy()
+        
+        predictions_denorm = scaler.inverse_transform(
+            np.concatenate([predictions.reshape(-1, 1), np.zeros((len(predictions), 13))], axis=1)
+        )[:, 0]
+        
+        actuals = latest_data['Close'].values[-len(predictions_denorm):]
+        mae = np.mean(np.abs(predictions_denorm - actuals))
+        rmse = np.sqrt(np.mean((predictions_denorm - actuals) ** 2))
+        logger.info(f"Model performance - MAE: {mae:.2f}, RMSE: {rmse:.2f}")
+        
+        return actuals, predictions_denorm
+    except Exception as e:
+        logger.error(f"Error in prepare_data_for_prediction: {str(e)}")
+        raise HTTPException(status_code=422, detail=f"Failed to prepare prediction data: {str(e)}")
+
+def main(symbol: str, timeframe: str):
+    """Command-line entry point for prediction"""
+    try:
+        logger.debug(f"Script started: Predicting for {symbol} with timeframe {timeframe}")
+        print(f"Starting prediction for {symbol} with timeframe {timeframe}")
+        if timeframe not in settings.TIMEFRAME_OPTIONS:
+            error_msg = f"Invalid timeframe. Must be one of: {', '.join(settings.TIMEFRAME_OPTIONS)}"
+            logger.error(error_msg)
+            print(error_msg)
+            sys.exit(1)
+        if timeframe == "24h":
+            result = ensemble_prediction(symbol)
+        else:
+            result = predict_next_price(symbol, timeframe)
+        if "error" in result:
+            logger.error(f"Prediction error: {result['error']}")
+            print(f"Error: {result['error']}")
+            sys.exit(1)
+        logger.debug(f"Prediction result: {result}")
+        print(f"Prediction result: {result}")
+        return result
+    except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}", exc_info=True)
+        print(f"Unexpected error: {str(e)}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    if len(sys.argv) != 3:
+        print("Usage: python -m controllers.prediction <symbol> <timeframe>")
+        sys.exit(1)
+    main(sys.argv[1], sys.argv[2])

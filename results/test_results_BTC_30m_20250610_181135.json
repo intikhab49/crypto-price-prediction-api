@@ -1,0 +1,77 @@
+{
+    "symbol": "BTC",
+    "asset_type": "cryptocurrency",
+    "timeframe": "30m",
+    "timestamp": "2025-06-10T13:11:35.641665+00:00",
+    "prediction": {
+        "symbol": "BTC",
+        "timeframe": "30m",
+        "predicted_price": 109868.875,
+        "last_price": 109679.2109375,
+        "prediction_time": "2025-06-10T13:30:00+00:00",
+        "current_time": "2025-06-10T13:11:35.637360+00:00",
+        "probability": 0.5104930856274351,
+        "confidence_factors": {
+            "model_confidence": 0.8,
+            "price_levels": [
+                {
+                    "type": "resistance",
+                    "price": 110491.33699993341,
+                    "strength": 1.2844277655639984,
+                    "proximity": 0.005633581933521043,
+                    "signal": "reversal",
+                    "confidence": 0.9226313128142913
+                }
+            ],
+            "technical_indicators": [
+                {
+                    "indicator": "RSI",
+                    "value": 57.283489980855556,
+                    "signal": "neutral",
+                    "strength": 0.3
+                },
+                {
+                    "indicator": "MACD",
+                    "value": 123.80761634276132,
+                    "signal_line": 137.43501567614044,
+                    "signal": "bearish_trend",
+                    "strength": 0.4991552208608284,
+                    "trend_strength": 0.09915522086082838
+                },
+                {
+                    "indicator": "BollingerBands",
+                    "position": "within_bands",
+                    "signal": "continuation",
+                    "strength": 0.4,
+                    "bandwidth": 0.005544887134982033
+                },
+                {
+                    "indicator": "Volume",
+                    "value": 995151872.0,
+                    "sma": 2151795916.8,
+                    "ratio": 0.4624750257356748,
+                    "signal": "low",
+                    "strength": 0.292495005147135
+                }
+            ],
+            "timeframe_factor": 0.85,
+            "available_indicators": {
+                "rsi": true,
+                "macd": true,
+                "bollinger": true,
+                "volume": true
+            },
+            "weights": {
+                "model": 0.25,
+                "technical": 0.6,
+                "support_resistance": 0.15
+            }
+        },
+        "model_metrics": {
+            "lookback": 48,
+            "input_size": 26,
+            "hidden_size": 64,
+            "num_layers": 2
+        }
+    }
+}
